@@ -127,6 +127,9 @@ const CACHE_VIRTUAL_WRITE_VERSION: StoredMetaWriteVersion = 0;
 const CACHE_VIRTUAL_OFFSET: usize = 0;
 const CACHE_VIRTUAL_STORED_SIZE: usize = 0;
 
+/// bprumo TODO: doc
+const FLUSH_WINDOW_SIZE: usize = 1; // bprumo TODO: put back to 2
+
 pub const ACCOUNTS_DB_CONFIG_FOR_TESTING: AccountsDbConfig = AccountsDbConfig {
     index: Some(ACCOUNTS_INDEX_CONFIG_FOR_TESTING),
     accounts_hash_cache_path: None,
@@ -4495,13 +4498,16 @@ impl AccountsDb {
         let mut unflushable_unrooted_slot_count = 0;
         let max_flushed_root = self.accounts_cache.fetch_max_flush_root();
         let old_slot_flush_stats: Vec<_> = old_slots
-            .into_iter()
-            .filter_map(|old_slot| {
+            .windows(FLUSH_WINDOW_SIZE)
+            .filter_map(|old_slots| {
                 // Don't flush slots that are known to be unrooted
-                if old_slot > max_flushed_root {
-                    Some(self.flush_slot_cache(old_slot, None::<&mut fn(&_, &_) -> bool>))
+                if old_slots
+                    .iter()
+                    .all(|old_slot| *old_slot > max_flushed_root)
+                {
+                    Some(self.flush_slot_cache(old_slots[0], None::<&mut fn(&_, &_) -> bool>))
                 } else {
-                    unflushable_unrooted_slot_count += 1;
+                    unflushable_unrooted_slot_count += old_slots.len();
                     None
                 }
             })
@@ -4671,6 +4677,7 @@ impl AccountsDb {
         let is_dead_slot = accounts.is_empty();
         // Remove the account index entries from earlier roots that are outdated by later roots.
         // Safe because queries to the index will be reading updates from later roots.
+        //bprumo TODO: call purge_slot_cache_pubkeys() in loop for the slots
         self.purge_slot_cache_pubkeys(slot, purged_slot_pubkeys, pubkey_to_slot_set, is_dead_slot);
 
         if !is_dead_slot {
@@ -5831,7 +5838,7 @@ impl AccountsDb {
         &self,
         slot: Slot,
         infos: Vec<AccountInfo>,
-        accounts: &[(&Pubkey, &T)],
+        accounts: &[(&Pubkey, &T)], // bprumo TODO: add Slot to tuple
         previous_slot_entry_was_cached: bool,
     ) -> SlotList<AccountInfo> {
         // using a thread pool here results in deadlock panics from bank_hashes.write()
