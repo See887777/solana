@@ -1627,7 +1627,7 @@ impl<T: IndexValue> AccountsIndex<T> {
                     InMemAccountsIndex::lock_and_update_slot_list(
                         &account_entry,
                         (slot, account_info),
-                        None, // bprumo TODO: add real value
+                        None,
                         &mut _reclaims,
                         false,
                     );
@@ -1651,6 +1651,7 @@ impl<T: IndexValue> AccountsIndex<T> {
     pub fn upsert(
         &self,
         slot: Slot, // bprumo TODO: need prev slot and new slot
+        // bprumo TODO: add old_slot here
         pubkey: &Pubkey,
         account_owner: &Pubkey,
         account_data: &[u8],
