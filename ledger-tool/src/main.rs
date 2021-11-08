@@ -2513,6 +2513,7 @@ fn main() {
             let print_account_data = !arg_matches.is_present("no_account_data");
             let rent_collector = bank.rent_collector();
             let mut total_accounts_stats = bank::TotalAccountsStats::default();
+            let mut num_rent_paying_zero_data: usize = 0;
             let mut measure = Measure::start("processing accounts");
             for (pubkey, (account, slot)) in accounts.into_iter() {
                 let data_len = account.data().len();
@@ -2526,6 +2527,10 @@ fn main() {
                     || rent_collector.get_rent_due(&account).1
                 {
                     total_accounts_stats.num_rent_exempt_accounts += 1;
+                } else {
+                    if account.data().is_empty() {
+                        num_rent_paying_zero_data += 1;
+                    }
                 }
 
                 if print_account_contents {
@@ -2545,6 +2550,10 @@ fn main() {
             info!("{}", measure);
 
             println!("{:#?}", total_accounts_stats);
+            println!(
+                "number of accounts that are rent paying AND 0-data: {}",
+                num_rent_paying_zero_data
+            );
         }
         ("capitalization", Some(arg_matches)) => {
             let dev_halt_at_slot = value_t!(arg_matches, "halt_at_slot", Slot).ok();
