@@ -92,8 +92,13 @@ impl AccountsHashVerifier {
         fault_injection_rate_slots: u64,
         snapshot_config: Option<&SnapshotConfig>,
     ) {
-        Self::verify_accounts_package_hash(&accounts_package);
+        let mut measure_total = Measure::start("");
 
+        let mut measure_verify_accounts_package_hash = Measure::start("");
+        Self::verify_accounts_package_hash(&accounts_package);
+        measure_verify_accounts_package_hash.stop();
+
+        let mut measure_push_accounts_hashes_to_cluster = Measure::start("");
         Self::push_accounts_hashes_to_cluster(
             &accounts_package,
             cluster_info,
@@ -103,8 +108,22 @@ impl AccountsHashVerifier {
             exit,
             fault_injection_rate_slots,
         );
+        measure_push_accounts_hashes_to_cluster.stop();
 
+
+        let mut measure_submit_for_packaging = Measure::start("");
         Self::submit_for_packaging(accounts_package, pending_snapshot_package, snapshot_config);
+        measure_submit_for_packaging.stop();
+
+
+        measure_total.stop();
+        datapoint_info!(
+            "accounts_hash_verifier-process_accounts_package",
+            ("verify_accounts_package_hash-time-us", measure_verify_accounts_package_hash.as_us(), i64),
+            ("push_accounts_hashes_to_cluster-time-us", measure_push_accounts_hashes_to_cluster.as_us(), i64),
+            ("submit_for_packaging-time-us", measure_submit_for_packaging.as_us(), i64),
+            ("total-time-us", measure_total.as_us(), i64),
+        );
     }
 
     fn verify_accounts_package_hash(accounts_package: &AccountsPackage) {
