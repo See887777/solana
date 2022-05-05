@@ -152,7 +152,7 @@ fn do_test_optimistic_confirmation_violation_with_or_without_tower(with_tower: b
     validator_configs[2].voting_disabled = true;
 
     let mut config = ClusterConfig {
-        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS + node_stakes.iter().sum(),
+        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS + node_stakes.iter().sum::<u64>(),
         node_stakes,
         validator_configs,
         validator_keys: Some(validator_keys),

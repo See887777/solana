@@ -298,7 +298,7 @@ fn test_slot_hash_expiry() {
     validator_configs[1].voting_disabled = true;
 
     let mut config = ClusterConfig {
-        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS + node_stakes.iter().sum(),
+        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS + node_stakes.iter().sum::<u64>(),
         node_stakes,
         validator_configs,
         validator_keys: Some(validator_keys),

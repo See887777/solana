@@ -28,7 +28,6 @@ use {
     solana_sdk::{
         clock::{Slot, MAX_PROCESSING_AGE},
         hash::Hash,
-        native_token::LAMPORTS_PER_SOL,
         pubkey::Pubkey,
         signature::{Keypair, Signer},
     },
