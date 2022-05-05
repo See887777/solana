@@ -359,8 +359,8 @@ fn test_mainnet_beta_cluster_type() {
 
     let mut config = ClusterConfig {
         cluster_type: ClusterType::MainnetBeta,
-        node_stakes: vec![100; 1],
-        cluster_lamports: 1_000,
+        node_stakes: vec![10_000_000_000; 1],
+        cluster_lamports: 1_000_000_000_000,
         validator_configs: make_identical_validator_configs(
             &ValidatorConfig::default_for_test(),
             1,
@@ -1372,8 +1372,8 @@ fn test_wait_for_max_stake() {
     solana_logger::setup_with_default(RUST_LOG_FILTER);
     let validator_config = ValidatorConfig::default_for_test();
     let mut config = ClusterConfig {
-        cluster_lamports: 10_000,
-        node_stakes: vec![100; 4],
+        cluster_lamports: 10_000_000_000_000,
+        node_stakes: vec![10_000_000_000; 4],
         validator_configs: make_identical_validator_configs(&validator_config, 4),
         ..ClusterConfig::default()
     };
