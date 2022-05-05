@@ -275,8 +275,8 @@ fn test_two_unbalanced_stakes() {
 
     let mut cluster = LocalCluster::new(
         &mut ClusterConfig {
-            node_stakes: vec![DEFAULT_NODE_STAKE, 3],
-            cluster_lamports: DEFAULT_CLUSTER_LAMPORTS,
+            node_stakes: vec![DEFAULT_NODE_STAKE * 100, DEFAULT_NODE_STAKE],
+            cluster_lamports: DEFAULT_CLUSTER_LAMPORTS + DEFAULT_NODE_STAKE * 100,
             validator_configs: make_identical_validator_configs(&validator_config, 2),
             ticks_per_slot: num_ticks_per_slot,
             slots_per_epoch: num_slots_per_epoch,
@@ -345,7 +345,7 @@ fn test_restart_node() {
     let validator_config = ValidatorConfig::default_for_test();
     let mut cluster = LocalCluster::new(
         &mut ClusterConfig {
-            node_stakes: vec![DEFAULT_NODE_STAKE; 1],
+            node_stakes: vec![DEFAULT_NODE_STAKE],
             cluster_lamports: DEFAULT_CLUSTER_LAMPORTS,
             validator_configs: vec![safe_clone_config(&validator_config)],
             ticks_per_slot,
@@ -384,7 +384,7 @@ fn test_mainnet_beta_cluster_type() {
 
     let mut config = ClusterConfig {
         cluster_type: ClusterType::MainnetBeta,
-        node_stakes: vec![DEFAULT_NODE_STAKE; 1],
+        node_stakes: vec![DEFAULT_NODE_STAKE],
         cluster_lamports: DEFAULT_CLUSTER_LAMPORTS,
         validator_configs: make_identical_validator_configs(
             &ValidatorConfig::default_for_test(),
@@ -1107,8 +1107,8 @@ fn test_snapshot_restart_tower() {
         setup_snapshot_validator_config(snapshot_interval_slots, num_account_paths);
 
     let mut config = ClusterConfig {
-        node_stakes: vec![DEFAULT_NODE_STAKE, 10],
-        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS,
+        node_stakes: vec![DEFAULT_NODE_STAKE * 100, DEFAULT_NODE_STAKE],
+        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS + DEFAULT_NODE_STAKE * 100,
         validator_configs: vec![
             safe_clone_config(&leader_snapshot_test_config.validator_config),
             safe_clone_config(&validator_snapshot_test_config.validator_config),
@@ -1222,8 +1222,6 @@ fn test_snapshots_blockstore_floor() {
     let slot_floor = archive_info.slot();
 
     // Start up a new node from a snapshot
-    let validator_stake = 5;
-
     let cluster_nodes = discover_cluster(
         &cluster.entry_point_info.gossip,
         1,
@@ -1238,7 +1236,7 @@ fn test_snapshots_blockstore_floor() {
 
     cluster.add_validator(
         &validator_snapshot_test_config.validator_config,
-        validator_stake,
+        DEFAULT_NODE_STAKE,
         Arc::new(Keypair::new()),
         None,
         SocketAddrSpace::Unspecified,
@@ -1738,7 +1736,7 @@ fn do_test_future_tower(cluster_mode: ClusterMode) {
     let slots_per_epoch = 2048;
     let node_stakes = match cluster_mode {
         ClusterMode::MasterOnly => vec![DEFAULT_NODE_STAKE],
-        ClusterMode::MasterSlave => vec![DEFAULT_NODE_STAKE, 1],
+        ClusterMode::MasterSlave => vec![DEFAULT_NODE_STAKE * 100, DEFAULT_NODE_STAKE],
     };
 
     let validator_keys = vec![
@@ -1759,7 +1757,7 @@ fn do_test_future_tower(cluster_mode: ClusterMode) {
     };
 
     let mut config = ClusterConfig {
-        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS,
+        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS + DEFAULT_NODE_STAKE * 100,
         node_stakes: node_stakes.clone(),
         validator_configs: make_identical_validator_configs(
             &ValidatorConfig::default_for_test(),
@@ -1996,7 +1994,7 @@ fn test_restart_tower_rollback() {
 
     // First set up the cluster with 2 nodes
     let slots_per_epoch = 2048;
-    let node_stakes = vec![DEFAULT_NODE_STAKE, 1];
+    let node_stakes = vec![DEFAULT_NODE_STAKE * 100, DEFAULT_NODE_STAKE];
 
     let validator_strings = vec![
         "28bN3xyvrP4E8LwEgtLjhnkb7cY4amQb6DrYAbAYjgRV4GAGgkVM2K7wnxnAS7WDneuavza7x21MiafLu1HkwQt4",
@@ -2012,7 +2010,7 @@ fn test_restart_tower_rollback() {
     let b_pubkey = validator_keys[1].0.pubkey();
 
     let mut config = ClusterConfig {
-        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS,
+        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS + DEFAULT_NODE_STAKE * 100,
         node_stakes: node_stakes.clone(),
         validator_configs: make_identical_validator_configs(
             &ValidatorConfig::default_for_test(),
