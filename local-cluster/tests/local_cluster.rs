@@ -306,8 +306,8 @@ fn test_forwarding() {
     // Set up a cluster where one node is never the leader, so all txs sent to this node
     // will be have to be forwarded in order to be confirmed
     let mut config = ClusterConfig {
-        node_stakes: vec![DEFAULT_NODE_STAKE, 3],
-        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS,
+        node_stakes: vec![DEFAULT_NODE_STAKE * 100, DEFAULT_NODE_STAKE],
+        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS + DEFAULT_NODE_STAKE * 100,
         validator_configs: make_identical_validator_configs(
             &ValidatorConfig::default_for_test(),
             2,
