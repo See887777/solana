@@ -302,6 +302,7 @@ fn test_two_unbalanced_stakes() {
 #[test]
 #[serial]
 fn test_forwarding() {
+    solana_logger::setup_with_default(RUST_LOG_FILTER);
     // Set up a cluster where one node is never the leader, so all txs sent to this node
     // will be have to be forwarded in order to be confirmed
     let mut config = ClusterConfig {
