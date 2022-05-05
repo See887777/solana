@@ -2,10 +2,7 @@
 //! because these tests are run separately from the rest of local cluster tests.
 #![allow(clippy::integer_arithmetic)]
 use {
-    common::{
-        copy_blocks, create_custom_leader_schedule, last_vote_in_tower, open_blockstore,
-        purge_slots, remove_tower, wait_for_last_vote_in_tower_to_land_in_ledger, RUST_LOG_FILTER,
-    },
+    common::*,
     log::*,
     serial_test::serial,
     solana_core::validator::ValidatorConfig,
@@ -87,6 +84,10 @@ fn do_test_optimistic_confirmation_violation_with_or_without_tower(with_tower: b
     // First set up the cluster with 4 nodes
     let slots_per_epoch = 2048;
     let node_stakes = vec![31, 36, 33, 0];
+    let node_stakes = node_stakes
+        .into_iter()
+        .map(|stake| stake * DEFAULT_NODE_STAKE)
+        .collect::<Vec<_>>();
 
     let base_slot: Slot = 26; // S2
     let next_slot_on_a: Slot = 27; // S3
@@ -151,7 +152,7 @@ fn do_test_optimistic_confirmation_violation_with_or_without_tower(with_tower: b
     validator_configs[2].voting_disabled = true;
 
     let mut config = ClusterConfig {
-        cluster_lamports: 100_000,
+        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS + node_stakes.iter().sum(),
         node_stakes,
         validator_configs,
         validator_keys: Some(validator_keys),
