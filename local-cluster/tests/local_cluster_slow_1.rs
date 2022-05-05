@@ -271,7 +271,12 @@ fn test_kill_heaviest_partition() {
     // eventually choose the major partition
     // 4) Check for recovery
     let num_slots_per_validator = 8;
-    let partitions: [usize; 4] = [11, 10, 10, 10];
+    let partitions: [usize; 4] = [
+        11 * DEFAULT_NODE_STAKE as usize,
+        10 * DEFAULT_NODE_STAKE as usize,
+        10 * DEFAULT_NODE_STAKE as usize,
+        10 * DEFAULT_NODE_STAKE as usize,
+    ];
     let (leader_schedule, validator_keys) = create_custom_leader_schedule_with_random_keys(&[
         num_slots_per_validator * (partitions.len() - 1),
         num_slots_per_validator,
@@ -401,12 +406,12 @@ fn test_duplicate_shreds_broadcast_leader() {
     // Critical that bad_leader_stake + good_node_stake < DUPLICATE_THRESHOLD and that
     // bad_leader_stake + good_node_stake + our_node_stake > DUPLICATE_THRESHOLD so that
     // our vote is the determining factor
-    let bad_leader_stake = 10_000_000_000 * DEFAULT_NODE_STAKE;
+    let bad_leader_stake = 10_000_000 * DEFAULT_NODE_STAKE;
     // Ensure that the good_node_stake is always on the critical path, and the partition node
     // should never be on the critical path. This way, none of the bad shreds sent to the partition
     // node corrupt the good node.
-    let good_node_stake = 500_000 * DEFAULT_NODE_STAKE;
-    let our_node_stake = 10_000_000_000 * DEFAULT_NODE_STAKE;
+    let good_node_stake = 500 * DEFAULT_NODE_STAKE;
+    let our_node_stake = 10_000_000 * DEFAULT_NODE_STAKE;
     let partition_node_stake = 1 * DEFAULT_NODE_STAKE;
 
     let node_stakes = vec![
