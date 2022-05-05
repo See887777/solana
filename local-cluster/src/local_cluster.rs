@@ -129,6 +129,7 @@ impl LocalCluster {
     }
 
     pub fn new(config: &mut ClusterConfig, socket_addr_space: SocketAddrSpace) -> Self {
+        log::error!("bprumo DEBUG: LocalCluster::new()...");
         assert_eq!(config.validator_configs.len(), config.node_stakes.len());
 
         let mut validator_keys = {
@@ -237,6 +238,7 @@ impl LocalCluster {
         let leader_vote_keypair =
             Arc::new(Keypair::from_bytes(&leader_vote_keypair.to_bytes()).unwrap());
 
+        log::error!("bprumo DEBUG: Validator::new()...");
         let leader_server = Validator::new(
             leader_node,
             leader_keypair.clone(),
@@ -273,6 +275,7 @@ impl LocalCluster {
             genesis_config,
         };
 
+        log::error!("bprumo DEBUG: adding validators...");
         let node_pubkey_to_vote_key: HashMap<Pubkey, Arc<Keypair>> = keys_in_genesis
             .into_iter()
             .map(|keypairs| {
@@ -308,6 +311,7 @@ impl LocalCluster {
             );
         });
 
+        log::error!("bprumo DEBUG: discovering cluster 1...");
         discover_cluster(
             &cluster.entry_point_info.gossip,
             config.node_stakes.len() + config.num_listeners as usize,
@@ -315,6 +319,7 @@ impl LocalCluster {
         )
         .unwrap();
 
+        log::error!("bprumo DEBUG: discovering cluster 2...");
         discover_cluster(
             &cluster.entry_point_info.gossip,
             config.node_stakes.len(),
@@ -568,8 +573,8 @@ impl LocalCluster {
         let vote_account_pubkey = vote_account.pubkey();
         let node_pubkey = from_account.pubkey();
         info!(
-            "setup_vote_and_stake_accounts: {}, {}",
-            node_pubkey, vote_account_pubkey
+            "setup_vote_and_stake_accounts: {}, {}, amount: {}",
+            node_pubkey, vote_account_pubkey, amount,
         );
         let stake_account_keypair = Keypair::new();
         let stake_account_pubkey = stake_account_keypair.pubkey();
