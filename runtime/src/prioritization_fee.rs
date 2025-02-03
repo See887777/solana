@@ -1,5 +1,5 @@
 use {
-    solana_measure::measure,
+    solana_measure::measure_us,
     solana_sdk::{clock::Slot, pubkey::Pubkey, saturating_add_assign},
     std::collections::HashMap,
 };
@@ -18,6 +18,9 @@ struct PrioritizationFeeMetrics {
 
     // Count of transactions that have zero prioritization fee.
     non_prioritized_transactions_count: u64,
+
+    // Count of attempted update on finalized PrioritizationFee
+    attempted_update_on_finalized_fee_count: u64,
 
     // Total prioritization fees included in this slot.
     total_prioritization_fee: u64,
@@ -39,6 +42,10 @@ impl PrioritizationFeeMetrics {
 
     fn accumulate_total_update_elapsed_us(&mut self, val: u64) {
         saturating_add_assign!(self.total_update_elapsed_us, val);
+    }
+
+    fn increment_attempted_update_on_finalized_fee_count(&mut self, val: u64) {
+        saturating_add_assign!(self.attempted_update_on_finalized_fee_count, val);
     }
 
     fn update_prioritization_fee(&mut self, fee: u64) {
@@ -83,6 +90,11 @@ impl PrioritizationFeeMetrics {
                 i64
             ),
             (
+                "attempted_update_on_finalized_fee_count",
+                self.attempted_update_on_finalized_fee_count as i64,
+                i64
+            ),
+            (
                 "total_prioritization_fee",
                 self.total_prioritization_fee as i64,
                 i64
@@ -106,14 +118,15 @@ impl PrioritizationFeeMetrics {
     }
 }
 
+#[derive(Debug)]
 pub enum PrioritizationFeeError {
     // Not able to get account locks from sanitized transaction, which is required to update block
     // minimum fees.
     FailGetTransactionAccountLocks,
 
-    // Not able to read priority details, including compute-unit price, from transaction.
+    // Not able to read compute budget details, including compute-unit price, from transaction.
     // Compute-unit price is required to update block minimum fees.
-    FailGetTransactionPriorityDetails,
+    FailGetComputeBudgetDetails,
 
     // Block is already finalized, trying to finalize it again is usually unexpected
     BlockIsAlreadyFinalized,
@@ -152,20 +165,16 @@ impl Default for PrioritizationFee {
 
 impl PrioritizationFee {
     /// Update self for minimum transaction fee in the block and minimum fee for each writable account.
-    pub fn update(
-        &mut self,
-        transaction_fee: u64,
-        writable_accounts: &[Pubkey],
-    ) -> Result<(), PrioritizationFeeError> {
-        let (_, update_time) = measure!(
-            {
+    pub fn update(&mut self, transaction_fee: u64, writable_accounts: Vec<Pubkey>) {
+        let (_, update_us) = measure_us!({
+            if !self.is_finalized {
                 if transaction_fee < self.min_transaction_fee {
                     self.min_transaction_fee = transaction_fee;
                 }
 
-                for write_account in writable_accounts.iter() {
+                for write_account in writable_accounts {
                     self.min_writable_account_fees
-                        .entry(*write_account)
+                        .entry(write_account)
                         .and_modify(|write_lock_fee| {
                             *write_lock_fee = std::cmp::min(*write_lock_fee, transaction_fee)
                         })
@@ -175,13 +184,13 @@ impl PrioritizationFee {
                 self.metrics
                     .accumulate_total_prioritization_fee(transaction_fee);
                 self.metrics.update_prioritization_fee(transaction_fee);
-            },
-            "update_time",
-        );
+            } else {
+                self.metrics
+                    .increment_attempted_update_on_finalized_fee_count(1);
+            }
+        });
 
-        self.metrics
-            .accumulate_total_update_elapsed_us(update_time.as_us());
-        Ok(())
+        self.metrics.accumulate_total_update_elapsed_us(update_us);
     }
 
     /// Accounts that have minimum fees lesser or equal to the minimum fee in the block are redundant, they are
@@ -248,7 +257,7 @@ impl PrioritizationFee {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, solana_sdk::pubkey::Pubkey};
+    use {super::*, solana_pubkey::Pubkey};
 
     #[test]
     fn test_update_prioritization_fee() {
@@ -265,9 +274,7 @@ mod tests {
         // -----------------------------------------------------------------------
         // [5,   a, b             ]  -->  [5,     5,         5,         nil      ]
         {
-            assert!(prioritization_fee
-                .update(5, &[write_account_a, write_account_b])
-                .is_ok());
+            prioritization_fee.update(5, vec![write_account_a, write_account_b]);
             assert_eq!(5, prioritization_fee.get_min_transaction_fee().unwrap());
             assert_eq!(
                 5,
@@ -291,9 +298,7 @@ mod tests {
         // -----------------------------------------------------------------------
         // [9,      b, c          ]  -->  [5,     5,         5,         9        ]
         {
-            assert!(prioritization_fee
-                .update(9, &[write_account_b, write_account_c])
-                .is_ok());
+            prioritization_fee.update(9, vec![write_account_b, write_account_c]);
             assert_eq!(5, prioritization_fee.get_min_transaction_fee().unwrap());
             assert_eq!(
                 5,
@@ -320,9 +325,7 @@ mod tests {
         // -----------------------------------------------------------------------
         // [2,   a,    c          ]  -->  [2,     2,         5,         2        ]
         {
-            assert!(prioritization_fee
-                .update(2, &[write_account_a, write_account_c])
-                .is_ok());
+            prioritization_fee.update(2, vec![write_account_a, write_account_c]);
             assert_eq!(2, prioritization_fee.get_min_transaction_fee().unwrap());
             assert_eq!(
                 2,

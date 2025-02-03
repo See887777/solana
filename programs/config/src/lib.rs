@@ -1,18 +1,21 @@
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 pub mod config_instruction;
 pub mod config_processor;
+#[deprecated(
+    since = "2.0.0",
+    note = "The config program API no longer supports date instructions."
+)]
 pub mod date_instruction;
 
-pub use solana_sdk::config::program::id;
+pub use solana_sdk_ids::config::id;
+#[allow(deprecated)]
+use solana_stake_interface::config::Config as StakeConfig;
 use {
     bincode::{deserialize, serialize, serialized_size},
     serde_derive::{Deserialize, Serialize},
-    solana_sdk::{
-        account::{Account, AccountSharedData},
-        pubkey::Pubkey,
-        short_vec,
-        stake::config::Config as StakeConfig,
-    },
+    solana_account::{Account, AccountSharedData},
+    solana_pubkey::Pubkey,
+    solana_short_vec as short_vec,
 };
 
 pub trait ConfigState: serde::Serialize + Default {
@@ -21,6 +24,7 @@ pub trait ConfigState: serde::Serialize + Default {
 }
 
 // TODO move ConfigState into `solana_program` to implement trait locally
+#[allow(deprecated)]
 impl ConfigState for StakeConfig {
     fn max_space() -> u64 {
         serialized_size(&StakeConfig::default()).unwrap()

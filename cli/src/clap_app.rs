@@ -1,10 +1,11 @@
 use {
     crate::{
         address_lookup_table::AddressLookupTableSubCommands, cli::*, cluster_query::*, feature::*,
-        inflation::*, nonce::*, program::*, stake::*, validator_info::*, vote::*, wallet::*,
+        inflation::*, nonce::*, program::*, program_v4::ProgramV4SubCommands, stake::*,
+        validator_info::*, vote::*, wallet::*,
     },
     clap::{App, AppSettings, Arg, ArgGroup, SubCommand},
-    solana_clap_utils::{self, input_validators::*, keypair::*},
+    solana_clap_utils::{self, hidden_unless_forced, input_validators::*, keypair::*},
     solana_cli_config::CONFIG_FILE,
 };
 
@@ -13,6 +14,13 @@ pub fn get_clap_app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> A
         .about(about)
         .version(version)
         .setting(AppSettings::SubcommandRequiredElseHelp)
+        .arg(
+            Arg::with_name("skip_preflight")
+                .long("skip-preflight")
+                .global(true)
+                .takes_value(false)
+                .help("Skip the preflight check when sending transactions"),
+        )
         .arg({
             let arg = Arg::with_name("config_file")
                 .short("C")
@@ -37,7 +45,7 @@ pub fn get_clap_app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> A
                 .validator(is_url_or_moniker)
                 .help(
                     "URL for Solana's JSON RPC or moniker (or their first letter): \
-                       [mainnet-beta, testnet, devnet, localhost]",
+                    [mainnet-beta, testnet, devnet, localhost]",
                 ),
         )
         .arg(
@@ -66,16 +74,19 @@ pub fn get_clap_app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> A
                     "processed",
                     "confirmed",
                     "finalized",
-                    "recent", // Deprecated as of v1.5.5
-                    "single", // Deprecated as of v1.5.5
+                    "recent",       // Deprecated as of v1.5.5
+                    "single",       // Deprecated as of v1.5.5
                     "singleGossip", // Deprecated as of v1.5.5
-                    "root", // Deprecated as of v1.5.5
-                    "max", // Deprecated as of v1.5.5
+                    "root",         // Deprecated as of v1.5.5
+                    "max",          // Deprecated as of v1.5.5
                 ])
                 .value_name("COMMITMENT_LEVEL")
                 .hide_possible_values(true)
                 .global(true)
-                .help("Return information at the selected commitment level [possible values: processed, confirmed, finalized]"),
+                .help(
+                    "Return information at the selected commitment level \
+                    [possible values: processed, confirmed, finalized]",
+                ),
         )
         .arg(
             Arg::with_name("verbose")
@@ -96,6 +107,12 @@ pub fn get_clap_app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> A
                 .global(true)
                 .conflicts_with("use_quic")
                 .help("Use UDP when sending transactions."),
+        )
+        .arg(
+            Arg::with_name("use_tpu_client")
+                .long("use-tpu-client")
+                .global(true)
+                .help("Use TPU client when sending transactions."),
         )
         .arg(
             Arg::with_name("no_address_labels")
@@ -125,7 +142,7 @@ pub fn get_clap_app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> A
                 .takes_value(true)
                 .default_value(DEFAULT_RPC_TIMEOUT_SECONDS)
                 .global(true)
-                .hidden(true)
+                .hidden(hidden_unless_forced())
                 .help("Timeout value for RPC requests"),
         )
         .arg(
@@ -135,7 +152,7 @@ pub fn get_clap_app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> A
                 .takes_value(true)
                 .default_value(DEFAULT_CONFIRM_TX_TIMEOUT_SECONDS)
                 .global(true)
-                .hidden(true)
+                .hidden(hidden_unless_forced())
                 .help("Timeout value for initial transaction status"),
         )
         .cluster_query_subcommands()
@@ -143,6 +160,7 @@ pub fn get_clap_app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> A
         .inflation_subcommands()
         .nonce_subcommands()
         .program_subcommands()
+        .program_v4_subcommands()
         .address_lookup_table_subcommands()
         .stake_subcommands()
         .validator_info_subcommands()
@@ -205,14 +223,14 @@ pub fn get_clap_app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> A
         )
         .subcommand(
             SubCommand::with_name("completion")
-            .about("Generate completion scripts for various shells")
-            .arg(
-                Arg::with_name("shell")
-                .long("shell")
-                .short("s")
-                .takes_value(true)
-                .possible_values(&["bash", "fish", "zsh", "powershell", "elvish"])
-                .default_value("bash")
-            )
+                .about("Generate completion scripts for various shells")
+                .arg(
+                    Arg::with_name("shell")
+                        .long("shell")
+                        .short("s")
+                        .takes_value(true)
+                        .possible_values(&["bash", "fish", "zsh", "powershell", "elvish"])
+                        .default_value("bash"),
+                ),
         )
 }

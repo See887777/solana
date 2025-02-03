@@ -3,7 +3,13 @@ use {
     strum::Display,
 };
 
-pub const SUPPORTED_ARCHIVE_COMPRESSION: &[&str] = &["bz2", "gzip", "zstd", "lz4", "tar", "none"];
+// SUPPORTED_ARCHIVE_COMPRESSION lists the compression types that can be
+// specified on the command line. "zstd" and "lz4" are valid whereas "gzip",
+// "bz2", "tar" and "none" have been deprecated. Thus, all newly created
+// snapshots will either use "zstd" or "lz4". By keeping the deprecated types
+// in the ArchiveFormat enum, pre-existing snapshot archives with the
+// deprecated compression types can still be read.
+pub const SUPPORTED_ARCHIVE_COMPRESSION: &[&str] = &["zstd", "lz4"];
 pub const DEFAULT_ARCHIVE_COMPRESSION: &str = "zstd";
 
 pub const TAR_BZIP2_EXTENSION: &str = "tar.bz2";
@@ -17,7 +23,7 @@ pub const TAR_EXTENSION: &str = "tar";
 pub enum ArchiveFormat {
     TarBzip2,
     TarGzip,
-    TarZstd,
+    TarZstd { config: ZstdConfig },
     TarLz4,
     Tar,
 }
@@ -28,7 +34,7 @@ impl ArchiveFormat {
         match self {
             ArchiveFormat::TarBzip2 => TAR_BZIP2_EXTENSION,
             ArchiveFormat::TarGzip => TAR_GZIP_EXTENSION,
-            ArchiveFormat::TarZstd => TAR_ZSTD_EXTENSION,
+            ArchiveFormat::TarZstd { .. } => TAR_ZSTD_EXTENSION,
             ArchiveFormat::TarLz4 => TAR_LZ4_EXTENSION,
             ArchiveFormat::Tar => TAR_EXTENSION,
         }
@@ -36,11 +42,10 @@ impl ArchiveFormat {
 
     pub fn from_cli_arg(archive_format_str: &str) -> Option<ArchiveFormat> {
         match archive_format_str {
-            "bz2" => Some(ArchiveFormat::TarBzip2),
-            "gzip" => Some(ArchiveFormat::TarGzip),
-            "zstd" => Some(ArchiveFormat::TarZstd),
+            "zstd" => Some(ArchiveFormat::TarZstd {
+                config: ZstdConfig::default(),
+            }),
             "lz4" => Some(ArchiveFormat::TarLz4),
-            "tar" | "none" => Some(ArchiveFormat::Tar),
             _ => None,
         }
     }
@@ -55,7 +60,9 @@ impl TryFrom<&str> for ArchiveFormat {
         match extension {
             TAR_BZIP2_EXTENSION => Ok(ArchiveFormat::TarBzip2),
             TAR_GZIP_EXTENSION => Ok(ArchiveFormat::TarGzip),
-            TAR_ZSTD_EXTENSION => Ok(ArchiveFormat::TarZstd),
+            TAR_ZSTD_EXTENSION => Ok(ArchiveFormat::TarZstd {
+                config: ZstdConfig::default(),
+            }),
             TAR_LZ4_EXTENSION => Ok(ArchiveFormat::TarLz4),
             TAR_EXTENSION => Ok(ArchiveFormat::Tar),
             _ => Err(ParseError::InvalidExtension(extension.to_string())),
@@ -86,6 +93,13 @@ impl fmt::Display for ParseError {
     }
 }
 
+/// Configuration when using zstd as the snapshot archive format
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
+pub struct ZstdConfig {
+    /// The compression level to use when archiving with zstd
+    pub compression_level: i32,
+}
+
 #[cfg(test)]
 mod tests {
     use {super::*, std::iter::zip};
@@ -95,7 +109,13 @@ mod tests {
     fn test_extension() {
         assert_eq!(ArchiveFormat::TarBzip2.extension(), TAR_BZIP2_EXTENSION);
         assert_eq!(ArchiveFormat::TarGzip.extension(), TAR_GZIP_EXTENSION);
-        assert_eq!(ArchiveFormat::TarZstd.extension(), TAR_ZSTD_EXTENSION);
+        assert_eq!(
+            ArchiveFormat::TarZstd {
+                config: ZstdConfig::default(),
+            }
+            .extension(),
+            TAR_ZSTD_EXTENSION
+        );
         assert_eq!(ArchiveFormat::TarLz4.extension(), TAR_LZ4_EXTENSION);
         assert_eq!(ArchiveFormat::Tar.extension(), TAR_EXTENSION);
     }
@@ -112,7 +132,9 @@ mod tests {
         );
         assert_eq!(
             ArchiveFormat::try_from(TAR_ZSTD_EXTENSION),
-            Ok(ArchiveFormat::TarZstd)
+            Ok(ArchiveFormat::TarZstd {
+                config: ZstdConfig::default(),
+            })
         );
         assert_eq!(
             ArchiveFormat::try_from(TAR_LZ4_EXTENSION),
@@ -140,7 +162,9 @@ mod tests {
         );
         assert_eq!(
             ArchiveFormat::from_str(TAR_ZSTD_EXTENSION),
-            Ok(ArchiveFormat::TarZstd)
+            Ok(ArchiveFormat::TarZstd {
+                config: ZstdConfig::default(),
+            })
         );
         assert_eq!(
             ArchiveFormat::from_str(TAR_LZ4_EXTENSION),
@@ -159,12 +183,10 @@ mod tests {
     #[test]
     fn test_from_cli_arg() {
         let golden = [
-            Some(ArchiveFormat::TarBzip2),
-            Some(ArchiveFormat::TarGzip),
-            Some(ArchiveFormat::TarZstd),
+            Some(ArchiveFormat::TarZstd {
+                config: ZstdConfig::default(),
+            }),
             Some(ArchiveFormat::TarLz4),
-            Some(ArchiveFormat::Tar),
-            Some(ArchiveFormat::Tar),
         ];
 
         for (arg, expected) in zip(SUPPORTED_ARCHIVE_COMPRESSION.iter(), golden.into_iter()) {

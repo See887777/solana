@@ -1,11 +1,13 @@
 //! The `gossip_service` module implements the network control plane.
 
 use {
-    crate::{cluster_info::ClusterInfo, legacy_contact_info::LegacyContactInfo as ContactInfo},
+    crate::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     crossbeam_channel::{unbounded, Sender},
     rand::{thread_rng, Rng},
-    solana_client::{connection_cache::ConnectionCache, thin_client::ThinClient},
+    solana_client::{connection_cache::ConnectionCache, tpu_client::TpuClientWrapper},
+    solana_net_utils::DEFAULT_IP_ECHO_SERVER_THREADS,
     solana_perf::recycler::Recycler,
+    solana_rpc_client::rpc_client::RpcClient,
     solana_runtime::bank_forks::BankForks,
     solana_sdk::{
         pubkey::Pubkey,
@@ -15,6 +17,7 @@ use {
         socket::SocketAddrSpace,
         streamer::{self, StreamerReceiveStats},
     },
+    solana_tpu_client::tpu_client::{TpuClient, TpuClientConfig},
     std::{
         collections::HashSet,
         net::{SocketAddr, TcpListener, UdpSocket},
@@ -39,7 +42,7 @@ impl GossipService {
         gossip_validators: Option<HashSet<Pubkey>>,
         should_check_duplicate_instance: bool,
         stats_reporter_sender: Option<Sender<Box<dyn FnOnce() + Send>>>,
-        exit: &Arc<AtomicBool>,
+        exit: Arc<AtomicBool>,
     ) -> Self {
         let (request_sender, request_receiver) = unbounded();
         let gossip_socket = Arc::new(gossip_socket);
@@ -50,17 +53,20 @@ impl GossipService {
         );
         let socket_addr_space = *cluster_info.socket_addr_space();
         let t_receiver = streamer::receiver(
+            "solRcvrGossip".to_string(),
             gossip_socket.clone(),
             exit.clone(),
             request_sender,
             Recycler::default(),
             Arc::new(StreamerReceiveStats::new("gossip_receiver")),
-            1,
+            Duration::from_millis(1), // coalesce
             false,
             None,
+            false,
         );
         let (consume_sender, listen_receiver) = unbounded();
         let t_socket_consume = cluster_info.clone().start_socket_consume_thread(
+            bank_forks.clone(),
             request_receiver,
             consume_sender,
             exit.clone(),
@@ -73,12 +79,10 @@ impl GossipService {
             should_check_duplicate_instance,
             exit.clone(),
         );
-        let t_gossip = cluster_info.clone().gossip(
-            bank_forks,
-            response_sender,
-            gossip_validators,
-            exit.clone(),
-        );
+        let t_gossip =
+            cluster_info
+                .clone()
+                .gossip(bank_forks, response_sender, gossip_validators, exit);
         let t_responder = streamer::responder(
             "Gossip",
             gossip_socket,
@@ -116,7 +120,7 @@ pub fn discover_cluster(
         Some(entrypoint),
         Some(num_nodes),
         DISCOVER_CLUSTER_TIMEOUT,
-        None, // find_node_by_pubkey
+        None, // find_nodes_by_pubkey
         None, // find_node_by_gossip_addr
         None, // my_gossip_addr
         0,    // my_shred_version
@@ -130,7 +134,7 @@ pub fn discover(
     entrypoint: Option<&SocketAddr>,
     num_nodes: Option<usize>, // num_nodes only counts validators, excludes spy nodes
     timeout: Duration,
-    find_node_by_pubkey: Option<Pubkey>,
+    find_nodes_by_pubkey: Option<&[Pubkey]>,
     find_node_by_gossip_addr: Option<&SocketAddr>,
     my_gossip_addr: Option<&SocketAddr>,
     my_shred_version: u16,
@@ -144,7 +148,7 @@ pub fn discover(
     let (gossip_service, ip_echo, spy_ref) = make_gossip_node(
         keypair,
         entrypoint,
-        &exit,
+        exit.clone(),
         my_gossip_addr,
         my_shred_version,
         true, // should_check_duplicate_instance,
@@ -157,13 +161,19 @@ pub fn discover(
     if let Some(my_gossip_addr) = my_gossip_addr {
         info!("Gossip Address: {:?}", my_gossip_addr);
     }
-    let _ip_echo_server = ip_echo
-        .map(|tcp_listener| solana_net_utils::ip_echo_server(tcp_listener, Some(my_shred_version)));
+
+    let _ip_echo_server = ip_echo.map(|tcp_listener| {
+        solana_net_utils::ip_echo_server(
+            tcp_listener,
+            DEFAULT_IP_ECHO_SERVER_THREADS,
+            Some(my_shred_version),
+        )
+    });
     let (met_criteria, elapsed, all_peers, tvu_peers) = spy(
         spy_ref.clone(),
         num_nodes,
         timeout,
-        find_node_by_pubkey,
+        find_nodes_by_pubkey,
         find_node_by_gossip_addr,
     );
 
@@ -194,45 +204,47 @@ pub fn discover(
     ))
 }
 
-/// Creates a ThinClient by selecting a valid node at random
+/// Creates a TpuClient by selecting a valid node at random
 pub fn get_client(
     nodes: &[ContactInfo],
-    socket_addr_space: &SocketAddrSpace,
     connection_cache: Arc<ConnectionCache>,
-) -> ThinClient {
-    let nodes: Vec<_> = nodes
-        .iter()
-        .filter_map(|node| ContactInfo::valid_client_facing_addr(node, socket_addr_space))
-        .collect();
-    let select = thread_rng().gen_range(0, nodes.len());
-    let (rpc, tpu) = nodes[select];
-    ThinClient::new(rpc, tpu, connection_cache)
-}
+) -> TpuClientWrapper {
+    let select = thread_rng().gen_range(0..nodes.len());
 
-pub fn get_multi_client(
-    nodes: &[ContactInfo],
-    socket_addr_space: &SocketAddrSpace,
-    connection_cache: Arc<ConnectionCache>,
-) -> (ThinClient, usize) {
-    let addrs: Vec<_> = nodes
-        .iter()
-        .filter_map(|node| ContactInfo::valid_client_facing_addr(node, socket_addr_space))
-        .collect();
-    let rpc_addrs: Vec<_> = addrs.iter().map(|addr| addr.0).collect();
-    let tpu_addrs: Vec<_> = addrs.iter().map(|addr| addr.1).collect();
+    let rpc_pubsub_url = format!("ws://{}/", nodes[select].rpc_pubsub().unwrap());
+    let rpc_url = format!("http://{}", nodes[select].rpc().unwrap());
 
-    let num_nodes = tpu_addrs.len();
-    (
-        ThinClient::new_from_addrs(rpc_addrs, tpu_addrs, connection_cache),
-        num_nodes,
-    )
+    match &*connection_cache {
+        ConnectionCache::Quic(cache) => TpuClientWrapper::Quic(
+            TpuClient::new_with_connection_cache(
+                Arc::new(RpcClient::new(rpc_url)),
+                rpc_pubsub_url.as_str(),
+                TpuClientConfig::default(),
+                cache.clone(),
+            )
+            .unwrap_or_else(|err| {
+                panic!("Could not create TpuClient with Quic Cache {err:?}");
+            }),
+        ),
+        ConnectionCache::Udp(cache) => TpuClientWrapper::Udp(
+            TpuClient::new_with_connection_cache(
+                Arc::new(RpcClient::new(rpc_url)),
+                rpc_pubsub_url.as_str(),
+                TpuClientConfig::default(),
+                cache.clone(),
+            )
+            .unwrap_or_else(|err| {
+                panic!("Could not create TpuClient with Udp Cache {err:?}");
+            }),
+        ),
+    }
 }
 
 fn spy(
     spy_ref: Arc<ClusterInfo>,
     num_nodes: Option<usize>,
     timeout: Duration,
-    find_node_by_pubkey: Option<Pubkey>,
+    find_nodes_by_pubkey: Option<&[Pubkey]>,
     find_node_by_gossip_addr: Option<&SocketAddr>,
 ) -> (
     bool,             // if found the specified nodes
@@ -253,14 +265,18 @@ fn spy(
             .collect::<Vec<_>>();
         tvu_peers = spy_ref.all_tvu_peers();
 
-        let found_node_by_pubkey = if let Some(pubkey) = find_node_by_pubkey {
-            all_peers.iter().any(|x| x.id == pubkey)
+        let found_nodes_by_pubkey = if let Some(pubkeys) = find_nodes_by_pubkey {
+            pubkeys
+                .iter()
+                .all(|pubkey| all_peers.iter().any(|node| node.pubkey() == pubkey))
         } else {
             false
         };
 
         let found_node_by_gossip_addr = if let Some(gossip_addr) = find_node_by_gossip_addr {
-            all_peers.iter().any(|x| x.gossip == *gossip_addr)
+            all_peers
+                .iter()
+                .any(|node| node.gossip() == Some(*gossip_addr))
         } else {
             false
         };
@@ -268,19 +284,19 @@ fn spy(
         if let Some(num) = num_nodes {
             // Only consider validators and archives for `num_nodes`
             let mut nodes: Vec<_> = tvu_peers.iter().collect();
-            nodes.sort();
+            nodes.sort_unstable_by_key(|node| node.pubkey());
             nodes.dedup();
 
             if nodes.len() >= num {
-                if found_node_by_pubkey || found_node_by_gossip_addr {
+                if found_nodes_by_pubkey || found_node_by_gossip_addr {
                     met_criteria = true;
                 }
 
-                if find_node_by_pubkey.is_none() && find_node_by_gossip_addr.is_none() {
+                if find_nodes_by_pubkey.is_none() && find_node_by_gossip_addr.is_none() {
                     met_criteria = true;
                 }
             }
-        } else if found_node_by_pubkey || found_node_by_gossip_addr {
+        } else if found_nodes_by_pubkey || found_node_by_gossip_addr {
             met_criteria = true;
         }
         if i % 20 == 0 {
@@ -299,7 +315,7 @@ fn spy(
 pub fn make_gossip_node(
     keypair: Keypair,
     entrypoint: Option<&SocketAddr>,
-    exit: &Arc<AtomicBool>,
+    exit: Arc<AtomicBool>,
     gossip_addr: Option<&SocketAddr>,
     shred_version: u16,
     should_check_duplicate_instance: bool,
@@ -357,7 +373,7 @@ mod tests {
             None,
             true, // should_check_duplicate_instance
             None,
-            &exit,
+            exit.clone(),
         );
         exit.store(true, Ordering::Relaxed);
         d.join().unwrap();
@@ -367,8 +383,8 @@ mod tests {
     fn test_gossip_services_spy() {
         const TIMEOUT: Duration = Duration::from_secs(5);
         let keypair = Keypair::new();
-        let peer0 = solana_sdk::pubkey::new_rand();
-        let peer1 = solana_sdk::pubkey::new_rand();
+        let peer0 = solana_pubkey::new_rand();
+        let peer1 = solana_pubkey::new_rand();
         let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), 0);
         let peer0_info = ContactInfo::new_localhost(&peer0, 0);
         let peer1_info = ContactInfo::new_localhost(&peer1, 0);
@@ -385,7 +401,7 @@ mod tests {
         let (met_criteria, elapsed, _, tvu_peers) = spy(spy_ref.clone(), None, TIMEOUT, None, None);
         assert!(!met_criteria);
         assert!((TIMEOUT..TIMEOUT + Duration::from_secs(1)).contains(&elapsed));
-        assert_eq!(tvu_peers, spy_ref.tvu_peers());
+        assert_eq!(tvu_peers, spy_ref.tvu_peers(ContactInfo::clone));
 
         // Find num_nodes
         let (met_criteria, _, _, _) = spy(spy_ref.clone(), Some(1), TIMEOUT, None, None);
@@ -394,27 +410,27 @@ mod tests {
         assert!(met_criteria);
 
         // Find specific node by pubkey
-        let (met_criteria, _, _, _) = spy(spy_ref.clone(), None, TIMEOUT, Some(peer0), None);
+        let (met_criteria, _, _, _) = spy(spy_ref.clone(), None, TIMEOUT, Some(&[peer0]), None);
         assert!(met_criteria);
         let (met_criteria, _, _, _) = spy(
             spy_ref.clone(),
             None,
             TIMEOUT,
-            Some(solana_sdk::pubkey::new_rand()),
+            Some(&[solana_pubkey::new_rand()]),
             None,
         );
         assert!(!met_criteria);
 
         // Find num_nodes *and* specific node by pubkey
-        let (met_criteria, _, _, _) = spy(spy_ref.clone(), Some(1), TIMEOUT, Some(peer0), None);
+        let (met_criteria, _, _, _) = spy(spy_ref.clone(), Some(1), TIMEOUT, Some(&[peer0]), None);
         assert!(met_criteria);
-        let (met_criteria, _, _, _) = spy(spy_ref.clone(), Some(3), TIMEOUT, Some(peer0), None);
+        let (met_criteria, _, _, _) = spy(spy_ref.clone(), Some(3), TIMEOUT, Some(&[peer0]), None);
         assert!(!met_criteria);
         let (met_criteria, _, _, _) = spy(
             spy_ref.clone(),
             Some(1),
             TIMEOUT,
-            Some(solana_sdk::pubkey::new_rand()),
+            Some(&[solana_pubkey::new_rand()]),
             None,
         );
         assert!(!met_criteria);

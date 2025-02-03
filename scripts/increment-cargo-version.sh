@@ -31,7 +31,7 @@ for ignore in "${ignores[@]}"; do
 done
 
 # shellcheck disable=2207
-Cargo_tomls=($(find . -mindepth 2 -name Cargo.toml "${not_paths[@]}"))
+Cargo_tomls=($(find . -name Cargo.toml "${not_paths[@]}"))
 
 # Collect the name of all the internal crates
 crates=()
@@ -45,7 +45,7 @@ MINOR=0
 PATCH=0
 SPECIAL=""
 
-semverParseInto "$(readCargoVariable version "${Cargo_tomls[0]}")" MAJOR MINOR PATCH SPECIAL
+semverParseInto "$(readCargoVariable version Cargo.toml)" MAJOR MINOR PATCH SPECIAL
 [[ -n $MAJOR ]] || usage
 
 currentVersion="$MAJOR\.$MINOR\.$PATCH$SPECIAL"
@@ -79,6 +79,9 @@ dropspecial)
 check)
   badTomls=()
   for Cargo_toml in "${Cargo_tomls[@]}"; do
+    if grep "^version = { workspace = true }" "$Cargo_toml" &>/dev/null; then
+      continue
+    fi
     if ! grep "^version *= *\"$currentVersion\"$" "$Cargo_toml" &>/dev/null; then
       badTomls+=("$Cargo_toml")
     fi
@@ -118,6 +121,11 @@ newVersion="$MAJOR.$MINOR.$PATCH$SPECIAL"
 
 # Update all the Cargo.toml files
 for Cargo_toml in "${Cargo_tomls[@]}"; do
+  if ! grep "$currentVersion" "$Cargo_toml"; then
+    echo "$Cargo_toml (skipped)"
+    continue
+  fi
+
   # Set new crate version
   (
     set -x
@@ -137,6 +145,16 @@ done
 
 # Update cargo lock files
 scripts/cargo-for-all-lock-files.sh tree >/dev/null
+
+# Only apply related changes
+(
+  shopt -s globstar
+  git diff --unified=0 ./**/Cargo.lock >cargo-lock-patch
+  grep -E '^(diff|index|---|\+\+\+|@@.*@@ name = .*|-version|\+version)' cargo-lock-patch >filtered-cargo-lock-patch
+  git checkout ./**/Cargo.lock
+  git apply --unidiff-zero filtered-cargo-lock-patch
+  rm cargo-lock-patch filtered-cargo-lock-patch
+)
 
 echo "$currentVersion -> $newVersion"
 

@@ -28,7 +28,7 @@ Each validator advertises separately on gossip the various parts of an
 
 - The `stash`: An epoch-long compressed set of all completed slots.
 - The `cache`: The Run-length Encoding (RLE) of the latest `N` completed
-  slots starting from some some slot `M`, where `N` is the number of slots
+  slots starting from some slot `M`, where `N` is the number of slots
   that will fit in an MTU-sized packet.
 
 `Epoch Slots` in gossip are updated every time a validator receives a
@@ -54,7 +54,7 @@ The different protocol strategies to address the above challenges:
    Blockstore tracks the latest root slot. RepairService will then periodically
    iterate every fork in blockstore starting from the root slot, sending repair
    requests to validators for any missing shreds. It will send at most some `N`
-   repair reqeusts per iteration. Shred repair should prioritize repairing
+   repair requests per iteration. Shred repair should prioritize repairing
    forks based on the leader's fork weight. Validators should only send repair
    requests to validators who have marked that slot as completed in their
    EpochSlots. Validators should prioritize repairing shreds in each slot

@@ -147,6 +147,7 @@ generous (and not expected) to rebase or reword commits such that each change
 matches the logical flow in your PR description.
 
 ### The PR / Issue Labels
+
 Labels make it easier to manage and track PRs / issues.  Below some common labels
 that we use in Solana.  For the complete list of labels, please refer to the
 [label page](https://github.com/solana-labs/solana/issues/labels):
@@ -158,7 +159,7 @@ New feature gates should also always have a corresponding tracking issue
 and should be updated each time the feature is activated on a cluster.
 
 * "automerge": When a PR is labelled with "automerge", the PR will be
-automically merged once CI passes.  In general, this label should only
+automatically merged once CI passes.  In general, this label should only
 be used for small hot-fix (fewer than 100 lines) or automatic generated
 PRs.  If you're uncertain, it's usually the case that the PR is not
 qualified as "automerge".
@@ -194,6 +195,38 @@ a commit.  After a reviewer adds feedback, they won't be checking on the status
 of that feedback after every new commit. Instead, directly mention the reviewer
 when you feel your PR is ready for another pass.
 
+### Is your PR easy to say "yes" to?
+
+PRs that are easier to review are more likely to be reviewed. Strive to make
+your PR easy to say "yes" to.
+
+Non-exhaustive list of things that make it *harder* to review:
+
+* Additional changes that are orthogonal to the problem statement and proposed
+  changes. Instead move those changes to a different PR.
+* Renaming variables/functions/types unnecessarily and/or without explanation.
+* Not following established conventions in the function/module/crate/repo.
+* Changing whitespace: moving code and/or reformatting code. Make such changes
+  in a separate PR.
+* Force-pushing the branch unnecessarily; this makes it harder to track any
+  previous comments on specific lines of code, and also harder to track changes
+  already reviewed from previous commits.
+  * When force-pushing is required—for example to handle a merge conflict—and
+    no new changes have been made since the previous review, indicating as such
+    is beneficial.
+ * Not responding to comments from previous rounds of review. Follow the
+   guidance in [How to manage review feedback?](#how-to-manage-review-feedback).
+
+Non-exhaustive list of things that make it *easier* to review:
+
+* Adding tests for all new/changed behavior.
+* Including in the PR's description any non-automated testing that was
+  performed.
+* Including relevant results for changes that target performance improvements.
+
+Note that these lists are *independent* of how simple/complicated the actual
+*code* changes are.
+
 ## Draft Pull Requests
 
 If you want early feedback on your PR, use GitHub's "Draft Pull Request"
@@ -217,14 +250,14 @@ before the PR can be merged.  Here are the steps:
 * Under the newly-created directory, create a Cargo.toml file.  Below is an
   example template:
 
-```
+```toml
 [package]
 name = "solana-<PACKAGE_NAME>"
 version = "0.0.1"
 description = "<DESCRIPTION>"
-authors = ["Solana Labs Maintainers <maintainers@solanalabs.com>"]
-repository = "https://github.com/solana-labs/solana"
-homepage = "https://solana.com/"
+authors = ["Anza Maintainers <maintainers@anza.xyz>"]
+repository = "https://github.com/anza-xyz/agave"
+homepage = "https://anza.xyz"
 documentation = "https://docs.rs/solana-<PACKAGE_NAME>"
 license = "Apache-2.0"
 edition = "2021"
@@ -235,7 +268,7 @@ edition = "2021"
 
 * Once all review feedback has been addressed, publish v0.0.1 of the crate
   under your personal crates.io account, and then transfer the crate ownership
-  to solana-grimes.
+  to "anza-team".
   https://crates.io/policies#package-ownership
 
 * After successful publication, update the PR by replacing the v0.0.1 version
@@ -252,7 +285,9 @@ edition = "2021"
 * All Rust code is linted with Clippy. If you'd prefer to ignore its advice, do
   so explicitly:
 
-  ```rust #[allow(clippy::too_many_arguments)] ```
+  ```rust
+  #[allow(clippy::too_many_arguments)]
+  ```
 
   Note: Clippy defaults can be overridden in the top-level file `.clippy.toml`.
 
@@ -280,17 +315,17 @@ Inventing new terms is allowed, but should only be done when the term is widely
 used and understood. Avoid introducing new 3-letter terms, which can be
 confused with 3-letter acronyms.
 
-[Terms currently in use](docs/src/terminology.md)
+[Terms currently in use](https://solana.com/docs/terminology)
 
 
 ## Design Proposals
 
-Solana's architecture is described by docs generated from markdown files in the `docs/src/`
-directory and viewable on the official [Solana Documentation](https://docs.solana.com) website.
+This Solana validator client's architecture is described by docs generated from markdown files in the `docs/src/`
+directory and viewable on the official [Solana Labs Validator Client](https://docs.solanalabs.com) documentation website.
 
 Current design proposals may be viewed on the docs site:
 
-1. [Accepted Proposals](https://docs.solana.com/proposals/accepted-design-proposals)
-2. [Implemented Proposals](https://docs.solana.com/implemented-proposals/implemented-proposals)
+1. [Accepted Proposals](https://docs.solanalabs.com/proposals/accepted-design-proposals)
+2. [Implemented Proposals](https://docs.solanalabs.com/implemented-proposals/implemented-proposals)
 
 New design proposals should follow this guide on [how to submit a design proposal](./docs/src/proposals.md#submit-a-design-proposal).

@@ -1,23 +1,21 @@
 use {
     rand::{CryptoRng, Rng, RngCore},
-    solana_sdk::{
-        clock::Slot,
-        hash::Hash,
-        instruction::CompiledInstruction,
-        signature::{Keypair, Signer},
-        stake,
-        system_instruction::SystemInstruction,
-        system_program, system_transaction,
-        transaction::Transaction,
-    },
-    solana_vote_program::vote_transaction,
+    solana_clock::Slot,
+    solana_hash::Hash,
+    solana_keypair::Keypair,
+    solana_message::compiled_instruction::CompiledInstruction,
+    solana_sdk_ids::{stake, system_program},
+    solana_signer::Signer,
+    solana_system_interface::instruction::SystemInstruction,
+    solana_transaction::Transaction,
+    solana_vote_program::{vote_state::TowerSync, vote_transaction},
 };
 
 pub fn test_tx() -> Transaction {
     let keypair1 = Keypair::new();
     let pubkey1 = keypair1.pubkey();
     let zero = Hash::default();
-    system_transaction::transfer(&keypair1, &pubkey1, 42, zero)
+    solana_system_transaction::transfer(&keypair1, &pubkey1, 42, zero)
 }
 
 pub fn test_invalid_tx() -> Transaction {
@@ -35,7 +33,7 @@ pub fn test_multisig_tx() -> Transaction {
 
     let transfer_instruction = SystemInstruction::Transfer { lamports };
 
-    let program_ids = vec![system_program::id(), stake::program::id()];
+    let program_ids = vec![system_program::id(), stake::id()];
 
     let instructions = vec![CompiledInstruction::new(
         0,
@@ -59,14 +57,14 @@ where
     let mut slots: Vec<Slot> = std::iter::repeat_with(|| rng.gen()).take(5).collect();
     slots.sort_unstable();
     slots.dedup();
-    let switch_proof_hash = rng.gen_bool(0.5).then(|| solana_sdk::hash::new_rand(rng));
-    vote_transaction::new_vote_transaction(
-        slots,
-        solana_sdk::hash::new_rand(rng), // bank_hash
-        solana_sdk::hash::new_rand(rng), // blockhash
-        &Keypair::generate(rng),         // node_keypair
-        &Keypair::generate(rng),         // vote_keypair
-        &Keypair::generate(rng),         // authorized_voter_keypair
+    let switch_proof_hash = rng.gen_bool(0.5).then(Hash::new_unique);
+    let tower_sync = TowerSync::new_from_slots(slots, Hash::default(), None);
+    vote_transaction::new_tower_sync_transaction(
+        tower_sync,
+        Hash::new_unique(), // blockhash
+        &Keypair::new(),    // node_keypair
+        &Keypair::new(),    // vote_keypair
+        &Keypair::new(),    // authorized_voter_keypair
         switch_proof_hash,
     )
 }

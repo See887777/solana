@@ -1,4 +1,4 @@
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 
 pub mod nonblocking;
 pub mod udp_client;
@@ -11,10 +11,12 @@ use {
     solana_connection_cache::{
         connection_cache::{
             BaseClientConnection, ClientError, ConnectionManager, ConnectionPool,
-            ConnectionPoolError, NewConnectionConfig,
+            ConnectionPoolError, NewConnectionConfig, Protocol,
         },
         connection_cache_stats::ConnectionCacheStats,
     },
+    solana_keypair::Keypair,
+    solana_net_utils::SocketConfig,
     std::{
         net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
         sync::Arc,
@@ -28,9 +30,11 @@ impl ConnectionPool for UdpPool {
     type BaseClientConnection = Udp;
     type NewConnectionConfig = UdpConfig;
 
-    fn add_connection(&mut self, config: &Self::NewConnectionConfig, addr: &SocketAddr) {
+    fn add_connection(&mut self, config: &Self::NewConnectionConfig, addr: &SocketAddr) -> usize {
         let connection = self.create_pool_entry(config, addr);
+        let idx = self.connections.len();
         self.connections.push(connection);
+        idx
     }
 
     fn num_connections(&self) -> usize {
@@ -59,8 +63,11 @@ pub struct UdpConfig {
 
 impl NewConnectionConfig for UdpConfig {
     fn new() -> Result<Self, ClientError> {
-        let socket = solana_net_utils::bind_with_any_port(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-            .map_err(Into::<ClientError>::into)?;
+        let socket = solana_net_utils::bind_with_any_port_with_config(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketConfig::default(),
+        )
+        .map_err(Into::<ClientError>::into)?;
         Ok(Self {
             udp_socket: Arc::new(socket),
         })
@@ -98,6 +105,9 @@ pub struct UdpConnectionManager {}
 impl ConnectionManager for UdpConnectionManager {
     type ConnectionPool = UdpPool;
     type NewConnectionConfig = UdpConfig;
+
+    const PROTOCOL: Protocol = Protocol::UDP;
+
     fn new_connection_pool(&self) -> Self::ConnectionPool {
         UdpPool {
             connections: Vec::default(),
@@ -108,7 +118,7 @@ impl ConnectionManager for UdpConnectionManager {
         UdpConfig::new().unwrap()
     }
 
-    fn get_port_offset(&self) -> u16 {
-        0
+    fn update_key(&self, _key: &Keypair) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
     }
 }

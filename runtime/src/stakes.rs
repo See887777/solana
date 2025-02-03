@@ -1,31 +1,31 @@
 //! Stakes serve as a cache of stake and vote accounts to derive
 //! node stakes
 use {
-    crate::{
-        stake_account,
-        stake_history::StakeHistory,
-        vote_account::{VoteAccount, VoteAccounts},
-    },
-    dashmap::DashMap,
+    crate::{stake_account, stake_history::StakeHistory},
     im::HashMap as ImHashMap,
     log::error,
     num_derive::ToPrimitive,
-    num_traits::ToPrimitive,
     rayon::{prelude::*, ThreadPool},
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
-        clock::{Epoch, Slot},
+        clock::Epoch,
         pubkey::Pubkey,
         stake::state::{Delegation, StakeActivationStatus},
+        vote::state::VoteStateVersions,
     },
-    solana_vote_program::vote_state::VoteState,
+    solana_stake_program::stake_state::Stake,
+    solana_vote::vote_account::{VoteAccount, VoteAccounts},
     std::{
-        collections::{HashMap, HashSet},
+        collections::HashMap,
         ops::Add,
         sync::{Arc, RwLock, RwLockReadGuard},
     },
     thiserror::Error,
 };
+
+mod serde_stakes;
+pub(crate) use serde_stakes::serde_stakes_to_delegation_format;
+pub use serde_stakes::SerdeStakesToStakeFormat;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -52,7 +52,8 @@ pub enum InvalidCacheEntryReason {
 
 type StakeAccount = stake_account::StakeAccount<Delegation>;
 
-#[derive(Default, Debug, AbiExample)]
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
+#[derive(Default, Debug)]
 pub(crate) struct StakesCache(RwLock<Stakes<StakeAccount>>);
 
 impl StakesCache {
@@ -64,7 +65,12 @@ impl StakesCache {
         self.0.read().unwrap()
     }
 
-    pub(crate) fn check_and_store(&self, pubkey: &Pubkey, account: &impl ReadableAccount) {
+    pub(crate) fn check_and_store(
+        &self,
+        pubkey: &Pubkey,
+        account: &impl ReadableAccount,
+        new_rate_activation_epoch: Option<Epoch>,
+    ) {
         // TODO: If the account is already cached as a vote or stake account
         // but the owner changes, then this needs to evict the account from
         // the cache. see:
@@ -74,87 +80,72 @@ impl StakesCache {
         // and so should be removed from cache as well.
         if account.lamports() == 0 {
             if solana_vote_program::check_id(owner) {
-                let mut stakes = self.0.write().unwrap();
-                stakes.remove_vote_account(pubkey);
+                let _old_vote_account = {
+                    let mut stakes = self.0.write().unwrap();
+                    stakes.remove_vote_account(pubkey)
+                };
             } else if solana_stake_program::check_id(owner) {
                 let mut stakes = self.0.write().unwrap();
-                stakes.remove_stake_delegation(pubkey);
+                stakes.remove_stake_delegation(pubkey, new_rate_activation_epoch);
             }
             return;
         }
         debug_assert_ne!(account.lamports(), 0u64);
         if solana_vote_program::check_id(owner) {
-            if VoteState::is_correct_size_and_initialized(account.data()) {
+            if VoteStateVersions::is_correct_size_and_initialized(account.data()) {
                 match VoteAccount::try_from(account.to_account_shared_data()) {
                     Ok(vote_account) => {
-                        {
-                            // Called to eagerly deserialize vote state
-                            let _res = vote_account.vote_state();
-                        }
-                        let mut stakes = self.0.write().unwrap();
-                        stakes.upsert_vote_account(pubkey, vote_account);
+                        // drop the old account after releasing the lock
+                        let _old_vote_account = {
+                            let mut stakes = self.0.write().unwrap();
+                            stakes.upsert_vote_account(
+                                pubkey,
+                                vote_account,
+                                new_rate_activation_epoch,
+                            )
+                        };
                     }
                     Err(_) => {
-                        let mut stakes = self.0.write().unwrap();
-                        stakes.remove_vote_account(pubkey)
+                        // drop the old account after releasing the lock
+                        let _old_vote_account = {
+                            let mut stakes = self.0.write().unwrap();
+                            stakes.remove_vote_account(pubkey)
+                        };
                     }
                 }
             } else {
-                let mut stakes = self.0.write().unwrap();
-                stakes.remove_vote_account(pubkey)
+                // drop the old account after releasing the lock
+                let _old_vote_account = {
+                    let mut stakes = self.0.write().unwrap();
+                    stakes.remove_vote_account(pubkey)
+                };
             };
         } else if solana_stake_program::check_id(owner) {
             match StakeAccount::try_from(account.to_account_shared_data()) {
                 Ok(stake_account) => {
                     let mut stakes = self.0.write().unwrap();
-                    stakes.upsert_stake_delegation(*pubkey, stake_account);
+                    stakes.upsert_stake_delegation(
+                        *pubkey,
+                        stake_account,
+                        new_rate_activation_epoch,
+                    );
                 }
                 Err(_) => {
                     let mut stakes = self.0.write().unwrap();
-                    stakes.remove_stake_delegation(pubkey);
+                    stakes.remove_stake_delegation(pubkey, new_rate_activation_epoch);
                 }
             }
         }
     }
 
-    pub(crate) fn activate_epoch(&self, next_epoch: Epoch, thread_pool: &ThreadPool) {
-        let mut stakes = self.0.write().unwrap();
-        stakes.activate_epoch(next_epoch, thread_pool)
-    }
-
-    pub(crate) fn handle_invalid_keys(
+    pub(crate) fn activate_epoch(
         &self,
-        invalid_stake_keys: DashMap<Pubkey, InvalidCacheEntryReason>,
-        invalid_vote_keys: DashMap<Pubkey, InvalidCacheEntryReason>,
-        current_slot: Slot,
+        next_epoch: Epoch,
+        thread_pool: &ThreadPool,
+        new_rate_activation_epoch: Option<Epoch>,
     ) {
-        if invalid_stake_keys.is_empty() && invalid_vote_keys.is_empty() {
-            return;
-        }
-
-        // Prune invalid stake delegations and vote accounts that were
-        // not properly evicted in normal operation.
         let mut stakes = self.0.write().unwrap();
-
-        for (stake_pubkey, reason) in invalid_stake_keys {
-            stakes.remove_stake_delegation(&stake_pubkey);
-            datapoint_warn!(
-                "bank-stake_delegation_accounts-invalid-account",
-                ("slot", current_slot as i64, i64),
-                ("stake-address", format!("{stake_pubkey:?}"), String),
-                ("reason", reason.to_i64().unwrap_or_default(), i64),
-            );
-        }
-
-        for (vote_pubkey, reason) in invalid_vote_keys {
-            stakes.remove_vote_account(&vote_pubkey);
-            datapoint_warn!(
-                "bank-stake_delegation_accounts-invalid-account",
-                ("slot", current_slot as i64, i64),
-                ("vote-address", format!("{vote_pubkey:?}"), String),
-                ("reason", reason.to_i64().unwrap_or_default(), i64),
-            );
-        }
+        stakes.activate_epoch(next_epoch, thread_pool, new_rate_activation_epoch)
     }
 }
 
@@ -162,10 +153,11 @@ impl StakesCache {
 /// [`Stakes<Delegation>`] is equivalent to the old code and is used for backward
 /// compatibility in [`crate::bank::BankFieldsToDeserialize`].
 /// But banks cache [`Stakes<StakeAccount>`] which includes the entire stake
-/// account and StakeState deserialized from the account. Doing so, will remove
+/// account and StakeStateV2 deserialized from the account. Doing so, will remove
 /// the need to load the stake account from accounts-db when working with
 /// stake-delegations.
-#[derive(Default, Clone, PartialEq, Debug, Deserialize, Serialize, AbiExample)]
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
+#[derive(Default, Clone, PartialEq, Debug, Deserialize, Serialize)]
 pub struct Stakes<T: Clone> {
     /// vote accounts
     vote_accounts: VoteAccounts,
@@ -184,16 +176,19 @@ pub struct Stakes<T: Clone> {
 }
 
 // For backward compatibility, we can only serialize and deserialize
-// Stakes<Delegation>. However Bank caches Stakes<StakeAccount>. This type
-// mismatch incurs a conversion cost at epoch boundary when updating
-// EpochStakes.
-// Below type allows EpochStakes to include either a Stakes<StakeAccount> or
-// Stakes<Delegation> and so bypass the conversion cost between the two at the
-// epoch boundary.
-#[derive(Debug, AbiExample)]
+// Stakes<Delegation> in the old `epoch_stakes` bank snapshot field. However,
+// Stakes<StakeAccount> entries are added to the bank's epoch stakes hashmap
+// when crossing epoch boundaries and Stakes<Stake> entries are added when
+// starting up from bank snapshots that have the new epoch stakes field. By
+// using this enum, the cost of converting all entries to Stakes<Delegation> is
+// put off until serializing new snapshots. This helps avoid bogging down epoch
+// boundaries and startup with the conversion overhead.
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
+#[derive(Debug, Clone)]
 pub enum StakesEnum {
     Accounts(Stakes<StakeAccount>),
     Delegations(Stakes<Delegation>),
+    Stakes(Stakes<Stake>),
 }
 
 impl<T: Clone> Stakes<T> {
@@ -213,27 +208,56 @@ impl Stakes<StakeAccount> {
     /// cached.
     pub(crate) fn new<F>(stakes: &Stakes<Delegation>, get_account: F) -> Result<Self, Error>
     where
-        F: Fn(&Pubkey) -> Option<AccountSharedData>,
+        F: Fn(&Pubkey) -> Option<AccountSharedData> + Sync,
     {
-        let stake_delegations = stakes.stake_delegations.iter().map(|(pubkey, delegation)| {
-            let stake_account = match get_account(pubkey) {
-                None => return Err(Error::StakeAccountNotFound(*pubkey)),
-                Some(account) => account,
-            };
-            let stake_account = StakeAccount::try_from(stake_account)?;
-            // Sanity check that the delegation is consistent with what is
-            // stored in the account.
-            if stake_account.delegation() == *delegation {
-                Ok((*pubkey, stake_account))
-            } else {
-                Err(Error::InvalidDelegation(*pubkey))
-            }
-        });
+        let stake_delegations = stakes
+            .stake_delegations
+            .iter()
+            // im::HashMap doesn't support rayon so we manually build a temporary vector. Note this is
+            // what std HashMap::par_iter() does internally too.
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            // We use fold/reduce to aggregate the results, which does a bit more work than calling
+            // collect()/collect_vec_list() and then im::HashMap::from_iter(collected.into_iter()),
+            // but it does it in background threads, so effectively it's faster.
+            .try_fold(ImHashMap::new, |mut map, (pubkey, delegation)| {
+                let Some(stake_account) = get_account(pubkey) else {
+                    return Err(Error::StakeAccountNotFound(*pubkey));
+                };
+
+                // Assert that all valid vote-accounts referenced in stake delegations are already
+                // contained in `stakes.vote_account`.
+                let voter_pubkey = &delegation.voter_pubkey;
+                if stakes.vote_accounts.get(voter_pubkey).is_none() {
+                    if let Some(account) = get_account(voter_pubkey) {
+                        if VoteStateVersions::is_correct_size_and_initialized(account.data())
+                            && VoteAccount::try_from(account.clone()).is_ok()
+                        {
+                            error!("vote account not cached: {voter_pubkey}, {account:?}");
+                            return Err(Error::VoteAccountNotCached(*voter_pubkey));
+                        }
+                    }
+                }
+
+                let stake_account = StakeAccount::try_from(stake_account)?;
+                // Sanity check that the delegation is consistent with what is
+                // stored in the account.
+                if stake_account.delegation() == delegation {
+                    map.insert(*pubkey, stake_account);
+                    Ok(map)
+                } else {
+                    Err(Error::InvalidDelegation(*pubkey))
+                }
+            })
+            .try_reduce(ImHashMap::new, |a, b| Ok(a.union(b)))?;
+
         // Assert that cached vote accounts are consistent with accounts-db.
+        //
+        // This currently includes ~5500 accounts, parallelizing brings minor
+        // (sub 2s) improvements.
         for (pubkey, vote_account) in stakes.vote_accounts.iter() {
-            let account = match get_account(pubkey) {
-                None => return Err(Error::VoteAccountNotFound(*pubkey)),
-                Some(account) => account,
+            let Some(account) = get_account(pubkey) else {
+                return Err(Error::VoteAccountNotFound(*pubkey));
             };
             let vote_account = vote_account.account();
             if vote_account != &account {
@@ -241,50 +265,41 @@ impl Stakes<StakeAccount> {
                 return Err(Error::VoteAccountMismatch(*pubkey));
             }
         }
-        // Assert that all valid vote-accounts referenced in
-        // stake delegations are already cached.
-        let voter_pubkeys: HashSet<Pubkey> = stakes
-            .stake_delegations
-            .values()
-            .map(|delegation| delegation.voter_pubkey)
-            .filter(|voter_pubkey| stakes.vote_accounts.get(voter_pubkey).is_none())
-            .collect();
-        for pubkey in voter_pubkeys {
-            let account = match get_account(&pubkey) {
-                None => continue,
-                Some(account) => account,
-            };
-            if VoteState::is_correct_size_and_initialized(account.data())
-                && VoteAccount::try_from(account.clone()).is_ok()
-            {
-                error!("vote account not cached: {pubkey}, {account:?}");
-                return Err(Error::VoteAccountNotCached(pubkey));
-            }
-        }
+
         Ok(Self {
             vote_accounts: stakes.vote_accounts.clone(),
-            stake_delegations: stake_delegations.collect::<Result<_, _>>()?,
+            stake_delegations,
             unused: stakes.unused,
             epoch: stakes.epoch,
             stake_history: stakes.stake_history.clone(),
         })
     }
 
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn new_for_tests(
+        epoch: Epoch,
+        vote_accounts: VoteAccounts,
+        stake_delegations: ImHashMap<Pubkey, StakeAccount>,
+    ) -> Self {
+        Self {
+            vote_accounts,
+            stake_delegations,
+            unused: 0,
+            epoch,
+            stake_history: StakeHistory::default(),
+        }
+    }
+
     pub(crate) fn history(&self) -> &StakeHistory {
         &self.stake_history
     }
 
-    fn activate_epoch(&mut self, next_epoch: Epoch, thread_pool: &ThreadPool) {
-        type StakesHashMap = HashMap</*voter:*/ Pubkey, /*stake:*/ u64>;
-        fn merge(mut acc: StakesHashMap, other: StakesHashMap) -> StakesHashMap {
-            if acc.len() < other.len() {
-                return merge(other, acc);
-            }
-            for (key, stake) in other {
-                *acc.entry(key).or_default() += stake;
-            }
-            acc
-        }
+    fn activate_epoch(
+        &mut self,
+        next_epoch: Epoch,
+        thread_pool: &ThreadPool,
+        new_rate_activation_epoch: Option<Epoch>,
+    ) {
         let stake_delegations: Vec<_> = self.stake_delegations.values().collect();
         // Wrap up the prev epoch by adding new stake history entry for the
         // prev epoch.
@@ -293,8 +308,11 @@ impl Stakes<StakeAccount> {
                 .par_iter()
                 .fold(StakeActivationStatus::default, |acc, stake_account| {
                     let delegation = stake_account.delegation();
-                    acc + delegation
-                        .stake_activating_and_deactivating(self.epoch, Some(&self.stake_history))
+                    acc + delegation.stake_activating_and_deactivating(
+                        self.epoch,
+                        &self.stake_history,
+                        new_rate_activation_epoch,
+                    )
                 })
                 .reduce(StakeActivationStatus::default, Add::add)
         });
@@ -302,42 +320,29 @@ impl Stakes<StakeAccount> {
         self.epoch = next_epoch;
         // Refresh the stake distribution of vote accounts for the next epoch,
         // using new stake history.
-        let delegated_stakes = thread_pool.install(|| {
-            stake_delegations
-                .par_iter()
-                .fold(HashMap::default, |mut delegated_stakes, stake_account| {
-                    let delegation = stake_account.delegation();
-                    let entry = delegated_stakes.entry(delegation.voter_pubkey).or_default();
-                    *entry += delegation.stake(self.epoch, Some(&self.stake_history));
-                    delegated_stakes
-                })
-                .reduce(HashMap::default, merge)
-        });
-        self.vote_accounts = self
-            .vote_accounts
-            .iter()
-            .map(|(&vote_pubkey, vote_account)| {
-                let delegated_stake = delegated_stakes
-                    .get(&vote_pubkey)
-                    .copied()
-                    .unwrap_or_default();
-                (vote_pubkey, (delegated_stake, vote_account.clone()))
-            })
-            .collect();
+        self.vote_accounts = refresh_vote_accounts(
+            thread_pool,
+            self.epoch,
+            &self.vote_accounts,
+            &stake_delegations,
+            &self.stake_history,
+            new_rate_activation_epoch,
+        );
     }
 
     /// Sum the stakes that point to the given voter_pubkey
     fn calculate_stake(
-        &self,
+        stake_delegations: &ImHashMap<Pubkey, StakeAccount>,
         voter_pubkey: &Pubkey,
         epoch: Epoch,
         stake_history: &StakeHistory,
+        new_rate_activation_epoch: Option<Epoch>,
     ) -> u64 {
-        self.stake_delegations
+        stake_delegations
             .values()
             .map(StakeAccount::delegation)
             .filter(|delegation| &delegation.voter_pubkey == voter_pubkey)
-            .map(|delegation| delegation.stake(epoch, Some(stake_history)))
+            .map(|delegation| delegation.stake(epoch, stake_history, new_rate_activation_epoch))
             .sum()
     }
 
@@ -350,44 +355,67 @@ impl Stakes<StakeAccount> {
             + self.vote_accounts.iter().map(get_lamports).sum::<u64>()
     }
 
-    fn remove_vote_account(&mut self, vote_pubkey: &Pubkey) {
-        self.vote_accounts.remove(vote_pubkey);
+    fn remove_vote_account(&mut self, vote_pubkey: &Pubkey) -> Option<VoteAccount> {
+        self.vote_accounts.remove(vote_pubkey).map(|(_, a)| a)
     }
 
-    fn remove_stake_delegation(&mut self, stake_pubkey: &Pubkey) {
+    fn remove_stake_delegation(
+        &mut self,
+        stake_pubkey: &Pubkey,
+        new_rate_activation_epoch: Option<Epoch>,
+    ) {
         if let Some(stake_account) = self.stake_delegations.remove(stake_pubkey) {
             let removed_delegation = stake_account.delegation();
-            let removed_stake = removed_delegation.stake(self.epoch, Some(&self.stake_history));
+            let removed_stake = removed_delegation.stake(
+                self.epoch,
+                &self.stake_history,
+                new_rate_activation_epoch,
+            );
             self.vote_accounts
                 .sub_stake(&removed_delegation.voter_pubkey, removed_stake);
         }
     }
 
-    fn upsert_vote_account(&mut self, vote_pubkey: &Pubkey, vote_account: VoteAccount) {
+    fn upsert_vote_account(
+        &mut self,
+        vote_pubkey: &Pubkey,
+        vote_account: VoteAccount,
+        new_rate_activation_epoch: Option<Epoch>,
+    ) -> Option<VoteAccount> {
         debug_assert_ne!(vote_account.lamports(), 0u64);
-        debug_assert!(vote_account.is_deserialized());
-        // unconditionally remove existing at first; there is no dependent calculated state for
-        // votes, not like stakes (stake codepath maintains calculated stake value grouped by
-        // delegated vote pubkey)
-        let stake = match self.vote_accounts.remove(vote_pubkey) {
-            None => self.calculate_stake(vote_pubkey, self.epoch, &self.stake_history),
-            Some((stake, _)) => stake,
-        };
-        let entry = (stake, vote_account);
-        self.vote_accounts.insert(*vote_pubkey, entry);
+
+        let stake_delegations = &self.stake_delegations;
+        self.vote_accounts.insert(*vote_pubkey, vote_account, || {
+            Self::calculate_stake(
+                stake_delegations,
+                vote_pubkey,
+                self.epoch,
+                &self.stake_history,
+                new_rate_activation_epoch,
+            )
+        })
     }
 
-    fn upsert_stake_delegation(&mut self, stake_pubkey: Pubkey, stake_account: StakeAccount) {
+    fn upsert_stake_delegation(
+        &mut self,
+        stake_pubkey: Pubkey,
+        stake_account: StakeAccount,
+        new_rate_activation_epoch: Option<Epoch>,
+    ) {
         debug_assert_ne!(stake_account.lamports(), 0u64);
         let delegation = stake_account.delegation();
         let voter_pubkey = delegation.voter_pubkey;
-        let stake = delegation.stake(self.epoch, Some(&self.stake_history));
+        let stake = delegation.stake(self.epoch, &self.stake_history, new_rate_activation_epoch);
         match self.stake_delegations.insert(stake_pubkey, stake_account) {
             None => self.vote_accounts.add_stake(&voter_pubkey, stake),
             Some(old_stake_account) => {
                 let old_delegation = old_stake_account.delegation();
                 let old_voter_pubkey = old_delegation.voter_pubkey;
-                let old_stake = old_delegation.stake(self.epoch, Some(&self.stake_history));
+                let old_stake = old_delegation.stake(
+                    self.epoch,
+                    &self.stake_history,
+                    new_rate_activation_epoch,
+                );
                 if voter_pubkey != old_voter_pubkey || stake != old_stake {
                     self.vote_accounts.sub_stake(&old_voter_pubkey, old_stake);
                     self.vote_accounts.add_stake(&voter_pubkey, stake);
@@ -400,9 +428,9 @@ impl Stakes<StakeAccount> {
         &self.stake_delegations
     }
 
-    pub(crate) fn highest_staked_node(&self) -> Option<Pubkey> {
+    pub(crate) fn highest_staked_node(&self) -> Option<&Pubkey> {
         let vote_account = self.vote_accounts.find_max_by_delegated_stake()?;
-        vote_account.node_pubkey()
+        Some(vote_account.node_pubkey())
     }
 }
 
@@ -411,6 +439,7 @@ impl StakesEnum {
         match self {
             StakesEnum::Accounts(stakes) => stakes.vote_accounts(),
             StakesEnum::Delegations(stakes) => stakes.vote_accounts(),
+            StakesEnum::Stakes(stakes) => stakes.vote_accounts(),
         }
     }
 
@@ -418,16 +447,20 @@ impl StakesEnum {
         match self {
             StakesEnum::Accounts(stakes) => stakes.staked_nodes(),
             StakesEnum::Delegations(stakes) => stakes.staked_nodes(),
+            StakesEnum::Stakes(stakes) => stakes.staked_nodes(),
         }
     }
 }
 
+/// This conversion is very memory intensive so should only be used in
+/// development contexts.
+#[cfg(feature = "dev-context-only-utils")]
 impl From<Stakes<StakeAccount>> for Stakes<Delegation> {
     fn from(stakes: Stakes<StakeAccount>) -> Self {
         let stake_delegations = stakes
             .stake_delegations
             .into_iter()
-            .map(|(pubkey, stake_account)| (pubkey, stake_account.delegation()))
+            .map(|(pubkey, stake_account)| (pubkey, *stake_account.delegation()))
             .collect();
         Self {
             vote_accounts: stakes.vote_accounts,
@@ -435,6 +468,59 @@ impl From<Stakes<StakeAccount>> for Stakes<Delegation> {
             unused: stakes.unused,
             epoch: stakes.epoch,
             stake_history: stakes.stake_history,
+        }
+    }
+}
+
+/// This conversion is very memory intensive so should only be used in
+/// development contexts.
+#[cfg(feature = "dev-context-only-utils")]
+impl From<Stakes<StakeAccount>> for Stakes<Stake> {
+    fn from(stakes: Stakes<StakeAccount>) -> Self {
+        let stake_delegations = stakes
+            .stake_delegations
+            .into_iter()
+            .map(|(pubkey, stake_account)| (pubkey, *stake_account.stake()))
+            .collect();
+        Self {
+            vote_accounts: stakes.vote_accounts,
+            stake_delegations,
+            unused: stakes.unused,
+            epoch: stakes.epoch,
+            stake_history: stakes.stake_history,
+        }
+    }
+}
+
+/// This conversion is memory intensive so should only be used in development
+/// contexts.
+#[cfg(feature = "dev-context-only-utils")]
+impl From<Stakes<Stake>> for Stakes<Delegation> {
+    fn from(stakes: Stakes<Stake>) -> Self {
+        let stake_delegations = stakes
+            .stake_delegations
+            .into_iter()
+            .map(|(pubkey, stake)| (pubkey, stake.delegation))
+            .collect();
+        Self {
+            vote_accounts: stakes.vote_accounts,
+            stake_delegations,
+            unused: stakes.unused,
+            epoch: stakes.epoch,
+            stake_history: stakes.stake_history,
+        }
+    }
+}
+
+/// This conversion is memory intensive so should only be used in development
+/// contexts.
+#[cfg(feature = "dev-context-only-utils")]
+impl From<StakesEnum> for Stakes<Delegation> {
+    fn from(stakes: StakesEnum) -> Self {
+        match stakes {
+            StakesEnum::Accounts(stakes) => stakes.into(),
+            StakesEnum::Delegations(stakes) => stakes,
+            StakesEnum::Stakes(stakes) => stakes.into(),
         }
     }
 }
@@ -456,58 +542,67 @@ impl From<Stakes<Delegation>> for StakesEnum {
 // Therefore, if one side is Stakes<StakeAccount> and the other is a
 // Stakes<Delegation> we convert the former one to Stakes<Delegation> before
 // comparing for equality.
+#[cfg(feature = "dev-context-only-utils")]
 impl PartialEq<StakesEnum> for StakesEnum {
     fn eq(&self, other: &StakesEnum) -> bool {
         match (self, other) {
             (Self::Accounts(stakes), Self::Accounts(other)) => stakes == other,
-            (Self::Accounts(stakes), Self::Delegations(other)) => {
-                let stakes = Stakes::<Delegation>::from(stakes.clone());
-                &stakes == other
-            }
-            (Self::Delegations(stakes), Self::Accounts(other)) => {
-                let other = Stakes::<Delegation>::from(other.clone());
-                stakes == &other
-            }
             (Self::Delegations(stakes), Self::Delegations(other)) => stakes == other,
+            (Self::Stakes(stakes), Self::Stakes(other)) => stakes == other,
+            (stakes, other) => {
+                let stakes = Stakes::<Delegation>::from(stakes.clone());
+                let other = Stakes::<Delegation>::from(other.clone());
+                stakes == other
+            }
         }
     }
 }
 
-// In order to maintain backward compatibility, the StakesEnum in EpochStakes
-// and SerializableVersionedBank should be serialized as Stakes<Delegation>.
-pub(crate) mod serde_stakes_enum_compat {
-    use {
-        super::*,
-        serde::{Deserialize, Deserializer, Serialize, Serializer},
-    };
-
-    pub(crate) fn serialize<S>(stakes: &StakesEnum, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match stakes {
-            StakesEnum::Accounts(stakes) => {
-                let stakes = Stakes::<Delegation>::from(stakes.clone());
-                stakes.serialize(serializer)
-            }
-            StakesEnum::Delegations(stakes) => stakes.serialize(serializer),
+fn refresh_vote_accounts(
+    thread_pool: &ThreadPool,
+    epoch: Epoch,
+    vote_accounts: &VoteAccounts,
+    stake_delegations: &[&StakeAccount],
+    stake_history: &StakeHistory,
+    new_rate_activation_epoch: Option<Epoch>,
+) -> VoteAccounts {
+    type StakesHashMap = HashMap</*voter:*/ Pubkey, /*stake:*/ u64>;
+    fn merge(mut stakes: StakesHashMap, other: StakesHashMap) -> StakesHashMap {
+        if stakes.len() < other.len() {
+            return merge(other, stakes);
         }
+        for (pubkey, stake) in other {
+            *stakes.entry(pubkey).or_default() += stake;
+        }
+        stakes
     }
-
-    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Arc<StakesEnum>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let stakes = Stakes::<Delegation>::deserialize(deserializer)?;
-        Ok(Arc::new(StakesEnum::Delegations(stakes)))
-    }
+    let delegated_stakes = thread_pool.install(|| {
+        stake_delegations
+            .par_iter()
+            .fold(HashMap::default, |mut delegated_stakes, stake_account| {
+                let delegation = stake_account.delegation();
+                let entry = delegated_stakes.entry(delegation.voter_pubkey).or_default();
+                *entry += delegation.stake(epoch, stake_history, new_rate_activation_epoch);
+                delegated_stakes
+            })
+            .reduce(HashMap::default, merge)
+    });
+    vote_accounts
+        .iter()
+        .map(|(&vote_pubkey, vote_account)| {
+            let delegated_stake = delegated_stakes
+                .get(&vote_pubkey)
+                .copied()
+                .unwrap_or_default();
+            (vote_pubkey, (delegated_stake, vote_account.clone()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use {
         super::*,
-        rand::Rng,
         rayon::ThreadPoolBuilder,
         solana_sdk::{account::WritableAccount, pubkey::Pubkey, rent::Rent, stake},
         solana_stake_program::stake_state,
@@ -518,10 +613,10 @@ pub(crate) mod tests {
     pub(crate) fn create_staked_node_accounts(
         stake: u64,
     ) -> ((Pubkey, AccountSharedData), (Pubkey, AccountSharedData)) {
-        let vote_pubkey = solana_sdk::pubkey::new_rand();
+        let vote_pubkey = solana_pubkey::new_rand();
         let vote_account =
-            vote_state::create_account(&vote_pubkey, &solana_sdk::pubkey::new_rand(), 0, 1);
-        let stake_pubkey = solana_sdk::pubkey::new_rand();
+            vote_state::create_account(&vote_pubkey, &solana_pubkey::new_rand(), 0, 1);
+        let stake_pubkey = solana_pubkey::new_rand();
         (
             (vote_pubkey, vote_account),
             (
@@ -540,7 +635,7 @@ pub(crate) mod tests {
         stake_state::create_account(
             stake_pubkey,
             vote_pubkey,
-            &vote_state::create_account(vote_pubkey, &solana_sdk::pubkey::new_rand(), 0, 1),
+            &vote_state::create_account(vote_pubkey, &solana_pubkey::new_rand(), 0, 1),
             &Rent::free(),
             stake,
         )
@@ -550,9 +645,9 @@ pub(crate) mod tests {
         stake: u64,
         epoch: Epoch,
     ) -> ((Pubkey, AccountSharedData), (Pubkey, AccountSharedData)) {
-        let vote_pubkey = solana_sdk::pubkey::new_rand();
+        let vote_pubkey = solana_pubkey::new_rand();
         let vote_account =
-            vote_state::create_account(&vote_pubkey, &solana_sdk::pubkey::new_rand(), 0, 1);
+            vote_state::create_account(&vote_pubkey, &solana_pubkey::new_rand(), 0, 1);
         (
             (vote_pubkey, vote_account),
             create_warming_stake_account(stake, epoch, &vote_pubkey),
@@ -565,13 +660,13 @@ pub(crate) mod tests {
         epoch: Epoch,
         vote_pubkey: &Pubkey,
     ) -> (Pubkey, AccountSharedData) {
-        let stake_pubkey = solana_sdk::pubkey::new_rand();
+        let stake_pubkey = solana_pubkey::new_rand();
         (
             stake_pubkey,
             stake_state::create_account_with_activation_epoch(
                 &stake_pubkey,
                 vote_pubkey,
-                &vote_state::create_account(vote_pubkey, &solana_sdk::pubkey::new_rand(), 0, 1),
+                &vote_state::create_account(vote_pubkey, &solana_pubkey::new_rand(), 0, 1),
                 &Rent::free(),
                 stake,
                 epoch,
@@ -590,8 +685,8 @@ pub(crate) mod tests {
             let ((vote_pubkey, vote_account), (stake_pubkey, mut stake_account)) =
                 create_staked_node_accounts(10);
 
-            stakes_cache.check_and_store(&vote_pubkey, &vote_account);
-            stakes_cache.check_and_store(&stake_pubkey, &stake_account);
+            stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
+            stakes_cache.check_and_store(&stake_pubkey, &stake_account, None);
             let stake = stake_state::stake_from(&stake_account).unwrap();
             {
                 let stakes = stakes_cache.stakes();
@@ -599,26 +694,26 @@ pub(crate) mod tests {
                 assert!(vote_accounts.get(&vote_pubkey).is_some());
                 assert_eq!(
                     vote_accounts.get_delegated_stake(&vote_pubkey),
-                    stake.stake(i, None)
+                    stake.stake(i, &StakeHistory::default(), None)
                 );
             }
 
             stake_account.set_lamports(42);
-            stakes_cache.check_and_store(&stake_pubkey, &stake_account);
+            stakes_cache.check_and_store(&stake_pubkey, &stake_account, None);
             {
                 let stakes = stakes_cache.stakes();
                 let vote_accounts = stakes.vote_accounts();
                 assert!(vote_accounts.get(&vote_pubkey).is_some());
                 assert_eq!(
                     vote_accounts.get_delegated_stake(&vote_pubkey),
-                    stake.stake(i, None)
+                    stake.stake(i, &StakeHistory::default(), None)
                 ); // stays old stake, because only 10 is activated
             }
 
             // activate more
             let mut stake_account =
-                create_stake_account(42, &vote_pubkey, &solana_sdk::pubkey::new_rand());
-            stakes_cache.check_and_store(&stake_pubkey, &stake_account);
+                create_stake_account(42, &vote_pubkey, &solana_pubkey::new_rand());
+            stakes_cache.check_and_store(&stake_pubkey, &stake_account, None);
             let stake = stake_state::stake_from(&stake_account).unwrap();
             {
                 let stakes = stakes_cache.stakes();
@@ -626,12 +721,12 @@ pub(crate) mod tests {
                 assert!(vote_accounts.get(&vote_pubkey).is_some());
                 assert_eq!(
                     vote_accounts.get_delegated_stake(&vote_pubkey),
-                    stake.stake(i, None)
+                    stake.stake(i, &StakeHistory::default(), None)
                 ); // now stake of 42 is activated
             }
 
             stake_account.set_lamports(0);
-            stakes_cache.check_and_store(&stake_pubkey, &stake_account);
+            stakes_cache.check_and_store(&stake_pubkey, &stake_account, None);
             {
                 let stakes = stakes_cache.stakes();
                 let vote_accounts = stakes.vote_accounts();
@@ -650,18 +745,18 @@ pub(crate) mod tests {
         let ((vote_pubkey, vote_account), (stake_pubkey, stake_account)) =
             create_staked_node_accounts(10);
 
-        stakes_cache.check_and_store(&vote_pubkey, &vote_account);
-        stakes_cache.check_and_store(&stake_pubkey, &stake_account);
+        stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
+        stakes_cache.check_and_store(&stake_pubkey, &stake_account, None);
 
         let ((vote11_pubkey, vote11_account), (stake11_pubkey, stake11_account)) =
             create_staked_node_accounts(20);
 
-        stakes_cache.check_and_store(&vote11_pubkey, &vote11_account);
-        stakes_cache.check_and_store(&stake11_pubkey, &stake11_account);
+        stakes_cache.check_and_store(&vote11_pubkey, &vote11_account, None);
+        stakes_cache.check_and_store(&stake11_pubkey, &stake11_account, None);
 
         let vote11_node_pubkey = vote_state::from(&vote11_account).unwrap().node_pubkey;
 
-        let highest_staked_node = stakes_cache.stakes().highest_staked_node();
+        let highest_staked_node = stakes_cache.stakes().highest_staked_node().copied();
         assert_eq!(highest_staked_node, Some(vote11_node_pubkey));
     }
 
@@ -675,8 +770,8 @@ pub(crate) mod tests {
         let ((vote_pubkey, mut vote_account), (stake_pubkey, stake_account)) =
             create_staked_node_accounts(10);
 
-        stakes_cache.check_and_store(&vote_pubkey, &vote_account);
-        stakes_cache.check_and_store(&stake_pubkey, &stake_account);
+        stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
+        stakes_cache.check_and_store(&stake_pubkey, &stake_account, None);
 
         {
             let stakes = stakes_cache.stakes();
@@ -686,7 +781,7 @@ pub(crate) mod tests {
         }
 
         vote_account.set_lamports(0);
-        stakes_cache.check_and_store(&vote_pubkey, &vote_account);
+        stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
 
         {
             let stakes = stakes_cache.stakes();
@@ -696,7 +791,7 @@ pub(crate) mod tests {
         }
 
         vote_account.set_lamports(1);
-        stakes_cache.check_and_store(&vote_pubkey, &vote_account);
+        stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
 
         {
             let stakes = stakes_cache.stakes();
@@ -710,7 +805,7 @@ pub(crate) mod tests {
         let mut pushed = vote_account.data().to_vec();
         pushed.push(0);
         vote_account.set_data(pushed);
-        stakes_cache.check_and_store(&vote_pubkey, &vote_account);
+        stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
 
         {
             let stakes = stakes_cache.stakes();
@@ -723,7 +818,7 @@ pub(crate) mod tests {
         let default_vote_state = VoteState::default();
         let versioned = VoteStateVersions::new_current(default_vote_state);
         vote_state::to(&versioned, &mut vote_account).unwrap();
-        stakes_cache.check_and_store(&vote_pubkey, &vote_account);
+        stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
 
         {
             let stakes = stakes_cache.stakes();
@@ -733,7 +828,7 @@ pub(crate) mod tests {
         }
 
         vote_account.set_data(cache_data);
-        stakes_cache.check_and_store(&vote_pubkey, &vote_account);
+        stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
 
         {
             let stakes = stakes_cache.stakes();
@@ -756,11 +851,11 @@ pub(crate) mod tests {
         let ((vote_pubkey2, vote_account2), (_stake_pubkey2, stake_account2)) =
             create_staked_node_accounts(10);
 
-        stakes_cache.check_and_store(&vote_pubkey, &vote_account);
-        stakes_cache.check_and_store(&vote_pubkey2, &vote_account2);
+        stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
+        stakes_cache.check_and_store(&vote_pubkey2, &vote_account2, None);
 
         // delegates to vote_pubkey
-        stakes_cache.check_and_store(&stake_pubkey, &stake_account);
+        stakes_cache.check_and_store(&stake_pubkey, &stake_account, None);
 
         let stake = stake_state::stake_from(&stake_account).unwrap();
 
@@ -770,14 +865,14 @@ pub(crate) mod tests {
             assert!(vote_accounts.get(&vote_pubkey).is_some());
             assert_eq!(
                 vote_accounts.get_delegated_stake(&vote_pubkey),
-                stake.stake(stakes.epoch, Some(&stakes.stake_history))
+                stake.stake(stakes.epoch, &stakes.stake_history, None)
             );
             assert!(vote_accounts.get(&vote_pubkey2).is_some());
             assert_eq!(vote_accounts.get_delegated_stake(&vote_pubkey2), 0);
         }
 
         // delegates to vote_pubkey2
-        stakes_cache.check_and_store(&stake_pubkey, &stake_account2);
+        stakes_cache.check_and_store(&stake_pubkey, &stake_account2, None);
 
         {
             let stakes = stakes_cache.stakes();
@@ -787,7 +882,7 @@ pub(crate) mod tests {
             assert!(vote_accounts.get(&vote_pubkey2).is_some());
             assert_eq!(
                 vote_accounts.get_delegated_stake(&vote_pubkey2),
-                stake.stake(stakes.epoch, Some(&stakes.stake_history))
+                stake.stake(stakes.epoch, &stakes.stake_history, None)
             );
         }
     }
@@ -801,14 +896,14 @@ pub(crate) mod tests {
         let ((vote_pubkey, vote_account), (stake_pubkey, stake_account)) =
             create_staked_node_accounts(10);
 
-        let stake_pubkey2 = solana_sdk::pubkey::new_rand();
+        let stake_pubkey2 = solana_pubkey::new_rand();
         let stake_account2 = create_stake_account(10, &vote_pubkey, &stake_pubkey2);
 
-        stakes_cache.check_and_store(&vote_pubkey, &vote_account);
+        stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
 
         // delegates to vote_pubkey
-        stakes_cache.check_and_store(&stake_pubkey, &stake_account);
-        stakes_cache.check_and_store(&stake_pubkey2, &stake_account2);
+        stakes_cache.check_and_store(&stake_pubkey, &stake_account, None);
+        stakes_cache.check_and_store(&stake_pubkey2, &stake_account2, None);
 
         {
             let stakes = stakes_cache.stakes();
@@ -825,8 +920,8 @@ pub(crate) mod tests {
         let ((vote_pubkey, vote_account), (stake_pubkey, stake_account)) =
             create_staked_node_accounts(10);
 
-        stakes_cache.check_and_store(&vote_pubkey, &vote_account);
-        stakes_cache.check_and_store(&stake_pubkey, &stake_account);
+        stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
+        stakes_cache.check_and_store(&stake_pubkey, &stake_account, None);
         let stake = stake_state::stake_from(&stake_account).unwrap();
 
         {
@@ -834,17 +929,17 @@ pub(crate) mod tests {
             let vote_accounts = stakes.vote_accounts();
             assert_eq!(
                 vote_accounts.get_delegated_stake(&vote_pubkey),
-                stake.stake(stakes.epoch, Some(&stakes.stake_history))
+                stake.stake(stakes.epoch, &stakes.stake_history, None)
             );
         }
         let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-        stakes_cache.activate_epoch(3, &thread_pool);
+        stakes_cache.activate_epoch(3, &thread_pool, None);
         {
             let stakes = stakes_cache.stakes();
             let vote_accounts = stakes.vote_accounts();
             assert_eq!(
                 vote_accounts.get_delegated_stake(&vote_pubkey),
-                stake.stake(stakes.epoch, Some(&stakes.stake_history))
+                stake.stake(stakes.epoch, &stakes.stake_history, None)
             );
         }
     }
@@ -859,8 +954,8 @@ pub(crate) mod tests {
         let ((vote_pubkey, vote_account), (stake_pubkey, stake_account)) =
             create_staked_node_accounts(10);
 
-        stakes_cache.check_and_store(&vote_pubkey, &vote_account);
-        stakes_cache.check_and_store(&stake_pubkey, &stake_account);
+        stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
+        stakes_cache.check_and_store(&stake_pubkey, &stake_account, None);
 
         {
             let stakes = stakes_cache.stakes();
@@ -873,6 +968,7 @@ pub(crate) mod tests {
         stakes_cache.check_and_store(
             &stake_pubkey,
             &AccountSharedData::new(1, 0, &stake::program::id()),
+            None,
         );
         {
             let stakes = stakes_cache.stakes();
@@ -891,6 +987,7 @@ pub(crate) mod tests {
     #[test]
     fn test_vote_balance_and_staked_normal() {
         let stakes_cache = StakesCache::default();
+        #[allow(non_local_definitions)]
         impl Stakes<StakeAccount> {
             fn vote_balance_and_warmed_staked(&self) -> u64 {
                 let vote_balance: u64 = self
@@ -910,8 +1007,8 @@ pub(crate) mod tests {
         let genesis_epoch = 0;
         let ((vote_pubkey, vote_account), (stake_pubkey, stake_account)) =
             create_warming_staked_node_accounts(10, genesis_epoch);
-        stakes_cache.check_and_store(&vote_pubkey, &vote_account);
-        stakes_cache.check_and_store(&stake_pubkey, &stake_account);
+        stakes_cache.check_and_store(&vote_pubkey, &vote_account, None);
+        stakes_cache.check_and_store(&stake_pubkey, &stake_account, None);
 
         {
             let stakes = stakes_cache.stakes();
@@ -921,7 +1018,7 @@ pub(crate) mod tests {
 
         let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
         for (epoch, expected_warmed_stake) in ((genesis_epoch + 1)..=3).zip(&[2, 3, 4]) {
-            stakes_cache.activate_epoch(epoch, &thread_pool);
+            stakes_cache.activate_epoch(epoch, &thread_pool, None);
             // vote_balance_and_staked() always remain to return same lamports
             // while vote_balance_and_warmed_staked() gradually increases
             let stakes = stakes_cache.stakes();
@@ -931,64 +1028,5 @@ pub(crate) mod tests {
                 *expected_warmed_stake
             );
         }
-    }
-
-    #[test]
-    fn test_serde_stakes_enum_compat() {
-        #[derive(Debug, PartialEq, Deserialize, Serialize)]
-        struct Dummy {
-            head: String,
-            #[serde(with = "serde_stakes_enum_compat")]
-            stakes: Arc<StakesEnum>,
-            tail: String,
-        }
-        let mut rng = rand::thread_rng();
-        let stakes_cache = StakesCache::new(Stakes {
-            unused: rng.gen(),
-            epoch: rng.gen(),
-            ..Stakes::default()
-        });
-        for _ in 0..rng.gen_range(5usize, 10) {
-            let vote_pubkey = solana_sdk::pubkey::new_rand();
-            let vote_account = vote_state::create_account(
-                &vote_pubkey,
-                &solana_sdk::pubkey::new_rand(), // node_pubkey
-                rng.gen_range(0, 101),           // commission
-                rng.gen_range(0, 1_000_000),     // lamports
-            );
-            stakes_cache.check_and_store(&vote_pubkey, &vote_account);
-            for _ in 0..rng.gen_range(10usize, 20) {
-                let stake_pubkey = solana_sdk::pubkey::new_rand();
-                let rent = Rent::with_slots_per_epoch(rng.gen());
-                let stake_account = stake_state::create_account(
-                    &stake_pubkey, // authorized
-                    &vote_pubkey,
-                    &vote_account,
-                    &rent,
-                    rng.gen_range(0, 1_000_000), // lamports
-                );
-                stakes_cache.check_and_store(&stake_pubkey, &stake_account);
-            }
-        }
-        let stakes: Stakes<StakeAccount> = stakes_cache.stakes().clone();
-        assert!(stakes.vote_accounts.as_ref().len() >= 5);
-        assert!(stakes.stake_delegations.len() >= 50);
-        let dummy = Dummy {
-            head: String::from("dummy-head"),
-            stakes: Arc::new(StakesEnum::from(stakes.clone())),
-            tail: String::from("dummy-tail"),
-        };
-        assert!(dummy.stakes.vote_accounts().as_ref().len() >= 5);
-        let data = bincode::serialize(&dummy).unwrap();
-        let other: Dummy = bincode::deserialize(&data).unwrap();
-        assert_eq!(other, dummy);
-        let stakes = Stakes::<Delegation>::from(stakes);
-        assert!(stakes.vote_accounts.as_ref().len() >= 5);
-        assert!(stakes.stake_delegations.len() >= 50);
-        let other = match &*other.stakes {
-            StakesEnum::Accounts(_) => panic!("wrong type!"),
-            StakesEnum::Delegations(delegations) => delegations,
-        };
-        assert_eq!(other, &stakes)
     }
 }

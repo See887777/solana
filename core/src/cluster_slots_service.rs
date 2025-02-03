@@ -1,5 +1,6 @@
+pub mod cluster_slots;
 use {
-    crate::cluster_slots::ClusterSlots,
+    cluster_slots::ClusterSlots,
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender},
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::blockstore::Blockstore,
@@ -181,7 +182,7 @@ impl ClusterSlotsService {
 mod test {
     use {
         super::*,
-        solana_gossip::{cluster_info::Node, crds_value::LowestSlot},
+        solana_gossip::{cluster_info::Node, crds_data::LowestSlot},
         solana_sdk::signature::{Keypair, Signer},
         solana_streamer::socket::SocketAddrSpace,
     };

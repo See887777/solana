@@ -575,6 +575,9 @@ impl Drop for SubscriptionTokenInner {
     }
 }
 
+// allowing dead code here to appease clippy, but unsure if/how the CounterToken is actually used.
+// further investigation would be necessary before removing
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct SubscriptionToken(Arc<SubscriptionTokenInner>, CounterToken);
 
@@ -595,7 +598,6 @@ mod tests {
         crate::rpc_pubsub_service::PubSubConfig,
         solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo},
         solana_runtime::bank::Bank,
-        std::str::FromStr,
     };
 
     struct ControlWrapper {
@@ -700,7 +702,7 @@ mod tests {
     fn subscription_info() {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let bank = Bank::new_for_tests(&genesis_config);
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
         let mut tracker = SubscriptionsTracker::new(bank_forks);
 
         tracker.subscribe(SubscriptionParams::Slot, 0.into(), || 0);
@@ -715,7 +717,7 @@ mod tests {
         assert_eq!(*info.last_notified_slot.read().unwrap(), 0);
 
         let account_params = SubscriptionParams::Account(AccountSubscriptionParams {
-            pubkey: Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap(),
+            pubkey: solana_inline_spl::token::id(),
             commitment: CommitmentConfig::finalized(),
             encoding: UiAccountEncoding::Base64Zstd,
             data_slice: None,
@@ -746,7 +748,7 @@ mod tests {
 
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let bank = Bank::new_for_tests(&genesis_config);
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
         let mut tracker = SubscriptionsTracker::new(bank_forks);
 
         tracker.subscribe(SubscriptionParams::Slot, 0.into(), || 0);
@@ -755,7 +757,7 @@ mod tests {
         assert_eq!(counts(&tracker), (0, 0, 0, 0));
 
         let account_params = SubscriptionParams::Account(AccountSubscriptionParams {
-            pubkey: Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap(),
+            pubkey: solana_inline_spl::token::id(),
             commitment: CommitmentConfig::finalized(),
             encoding: UiAccountEncoding::Base64Zstd,
             data_slice: None,
@@ -766,7 +768,7 @@ mod tests {
         assert_eq!(counts(&tracker), (0, 0, 0, 0));
 
         let account_params2 = SubscriptionParams::Account(AccountSubscriptionParams {
-            pubkey: Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap(),
+            pubkey: solana_inline_spl::token::id(),
             commitment: CommitmentConfig::confirmed(),
             encoding: UiAccountEncoding::Base64Zstd,
             data_slice: None,

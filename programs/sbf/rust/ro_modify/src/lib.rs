@@ -39,22 +39,6 @@ struct SolAccountInfo {
     executable: bool,
 }
 
-/// Rust representation of C's SolSignerSeed
-#[derive(Debug)]
-#[repr(C)]
-struct SolSignerSeedC {
-    addr: u64,
-    len: u64,
-}
-
-/// Rust representation of C's SolSignerSeeds
-#[derive(Debug)]
-#[repr(C)]
-struct SolSignerSeedsC {
-    addr: u64,
-    len: u64,
-}
-
 const READONLY_ACCOUNTS: &[SolAccountInfo] = &[
     SolAccountInfo {
         is_signer: false,
@@ -108,7 +92,7 @@ fn check_preconditions(
     Ok(())
 }
 
-solana_program::entrypoint!(process_instruction);
+solana_program::entrypoint_no_alloc!(process_instruction);
 fn process_instruction(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -150,8 +134,7 @@ fn process_instruction(
             // Not sure how to get a const data length in an Rc<RefCell<&mut [u8]>>
         }
         3 => {
-            let mut new_accounts =
-                &mut [READONLY_ACCOUNTS[0].clone(), READONLY_ACCOUNTS[1].clone()];
+            let new_accounts = &mut [READONLY_ACCOUNTS[0].clone(), READONLY_ACCOUNTS[1].clone()];
             new_accounts[1].owner_addr = &PUBKEY as *const _ as u64;
             let system_instruction = system_instruction::assign(accounts[1].key, program_id);
             let metas = &[SolAccountMeta {

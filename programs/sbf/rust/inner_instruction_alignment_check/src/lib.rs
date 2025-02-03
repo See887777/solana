@@ -11,7 +11,6 @@ use solana_program::{
 };
 
 solana_program::entrypoint_deprecated!(process_instruction);
-#[allow(clippy::unnecessary_wraps)]
 fn process_instruction(
     _program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -40,5 +39,5 @@ custom_heap_default!();
 #[no_mangle]
 fn custom_panic(info: &core::panic::PanicInfo<'_>) {
     // Full panic reporting
-    msg!(&format!("{}", info));
+    msg!(&format!("{info}"));
 }

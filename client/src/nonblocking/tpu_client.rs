@@ -5,15 +5,13 @@ use {
         ConnectionCache as BackendConnectionCache, ConnectionManager, ConnectionPool,
         NewConnectionConfig,
     },
+    solana_message::Message,
     solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool},
     solana_rpc_client::nonblocking::rpc_client::RpcClient,
-    solana_sdk::{
-        message::Message,
-        signers::Signers,
-        transaction::{Transaction, TransactionError},
-        transport::Result as TransportResult,
-    },
+    solana_signer::signers::Signers,
     solana_tpu_client::nonblocking::tpu_client::{Result, TpuClient as BackendTpuClient},
+    solana_transaction::Transaction,
+    solana_transaction_error::{TransactionError, TransportResult},
     std::sync::Arc,
 };
 
@@ -80,11 +78,12 @@ where
 impl TpuClient<QuicPool, QuicConnectionManager, QuicConfig> {
     /// Create a new client that disconnects when dropped
     pub async fn new(
+        name: &'static str,
         rpc_client: Arc<RpcClient>,
         websocket_url: &str,
         config: TpuClientConfig,
     ) -> Result<Self> {
-        let connection_cache = match ConnectionCache::default() {
+        let connection_cache = match ConnectionCache::new(name) {
             ConnectionCache::Quic(cache) => cache,
             ConnectionCache::Udp(_) => {
                 return Err(TpuSenderError::Custom(String::from(
@@ -120,7 +119,7 @@ where
         })
     }
 
-    pub async fn send_and_confirm_messages_with_spinner<T: Signers>(
+    pub async fn send_and_confirm_messages_with_spinner<T: Signers + ?Sized>(
         &self,
         messages: &[Message],
         signers: &T,

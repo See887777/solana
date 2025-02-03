@@ -19,7 +19,6 @@ vote_account=
 no_restart=0
 gossip_entrypoint=
 ledger_dir=
-maybe_allow_private_addr=
 
 usage() {
   if [[ -n $1 ]]; then
@@ -65,7 +64,7 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --no-airdrop ]]; then
       airdrops_enabled=0
       shift
-    # solana-validator options
+    # agave-validator options
     elif [[ $1 = --expected-genesis-hash ]]; then
       args+=("$1" "$2")
       shift 2
@@ -165,9 +164,6 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --known-validator ]]; then
       args+=("$1" "$2")
       shift 2
-    elif [[ $1 = --halt-on-known-validators-accounts-hash-mismatch ]]; then
-      args+=("$1")
-      shift
     elif [[ $1 = --max-genesis-archive-unpacked-size ]]; then
       args+=("$1" "$2")
       shift 2
@@ -177,16 +173,24 @@ while [[ -n $1 ]]; do
     elif [[ $1 == --expected-bank-hash ]]; then
       args+=("$1" "$2")
       shift 2
-    elif [[ $1 == --allow-private-addr ]]; then
-      args+=("$1")
-      maybe_allow_private_addr=$1
-      shift
     elif [[ $1 == --accounts-db-skip-shrink ]]; then
       args+=("$1")
       shift
     elif [[ $1 == --skip-require-tower ]]; then
       maybeRequireTower=false
       shift
+    elif [[ $1 == --block-production-method ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --transaction-structure ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --wen-restart ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --wen-restart-coordinator ]]; then
+      args+=("$1" "$2")
+      shift 2
     elif [[ $1 = -h ]]; then
       usage "$@"
     else
@@ -265,15 +269,16 @@ default_arg --ledger "$ledger_dir"
 default_arg --log -
 default_arg --full-rpc-api
 default_arg --no-incremental-snapshots
+default_arg --allow-private-addr
 
 if [[ $maybeRequireTower = true ]]; then
   default_arg --require-tower
 fi
 
 if [[ -n $SOLANA_CUDA ]]; then
-  program=$solana_validator_cuda
+  program=$agave_validator_cuda
 else
-  program=$solana_validator
+  program=$agave_validator
 fi
 
 set -e
@@ -335,8 +340,8 @@ setup_validator_accounts() {
   return 0
 }
 
-# shellcheck disable=SC2086 # Don't want to double quote "$maybe_allow_private_addr"
-rpc_url=$($solana_gossip $maybe_allow_private_addr rpc-url --timeout 180 --entrypoint "$gossip_entrypoint")
+# shellcheck disable=SC2086
+rpc_url=$($solana_gossip --allow-private-addr rpc-url --timeout 180 --entrypoint "$gossip_entrypoint")
 
 [[ -r "$identity" ]] || $solana_keygen new --no-passphrase -so "$identity"
 [[ -r "$vote_account" ]] || $solana_keygen new --no-passphrase -so "$vote_account"

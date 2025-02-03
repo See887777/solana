@@ -5,8 +5,8 @@ use {
     crossbeam_channel::Receiver,
     log::*,
     solana_entry::poh::Poh,
-    solana_measure::{measure, measure::Measure},
-    solana_sdk::poh_config::PohConfig,
+    solana_measure::{measure::Measure, measure_us},
+    solana_poh_config::PohConfig,
     std::{
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -97,31 +97,29 @@ impl PohService {
     pub fn new(
         poh_recorder: Arc<RwLock<PohRecorder>>,
         poh_config: &PohConfig,
-        poh_exit: &Arc<AtomicBool>,
+        poh_exit: Arc<AtomicBool>,
         ticks_per_slot: u64,
         pinned_cpu_core: usize,
         hashes_per_batch: u64,
         record_receiver: Receiver<Record>,
     ) -> Self {
-        let poh_exit_ = poh_exit.clone();
         let poh_config = poh_config.clone();
         let tick_producer = Builder::new()
             .name("solPohTickProd".to_string())
             .spawn(move || {
-                solana_sys_tuner::request_realtime_poh();
                 if poh_config.hashes_per_tick.is_none() {
                     if poh_config.target_tick_count.is_none() {
-                        Self::sleepy_tick_producer(
+                        Self::low_power_tick_producer(
                             poh_recorder,
                             &poh_config,
-                            &poh_exit_,
+                            &poh_exit,
                             record_receiver,
                         );
                     } else {
-                        Self::short_lived_sleepy_tick_producer(
+                        Self::short_lived_low_power_tick_producer(
                             poh_recorder,
                             &poh_config,
-                            &poh_exit_,
+                            &poh_exit,
                             record_receiver,
                         );
                     }
@@ -134,7 +132,7 @@ impl PohService {
                     }
                     Self::tick_producer(
                         poh_recorder,
-                        &poh_exit_,
+                        &poh_exit,
                         ticks_per_slot,
                         hashes_per_batch,
                         record_receiver,
@@ -144,7 +142,7 @@ impl PohService {
                         ),
                     );
                 }
-                poh_exit_.store(true, Ordering::Relaxed);
+                poh_exit.store(true, Ordering::Relaxed);
             })
             .unwrap();
 
@@ -162,7 +160,7 @@ impl PohService {
         target_tick_duration_ns.saturating_sub(adjustment_per_tick)
     }
 
-    fn sleepy_tick_producer(
+    fn low_power_tick_producer(
         poh_recorder: Arc<RwLock<PohRecorder>>,
         poh_config: &PohConfig,
         poh_exit: &AtomicBool,
@@ -206,7 +204,7 @@ impl PohService {
         }
     }
 
-    fn short_lived_sleepy_tick_producer(
+    fn short_lived_low_power_tick_producer(
         poh_recorder: Arc<RwLock<PohRecorder>>,
         poh_config: &PohConfig,
         poh_exit: &AtomicBool,
@@ -262,21 +260,16 @@ impl PohService {
                         record.mixin,
                         std::mem::take(&mut record.transactions),
                     );
-                    // what do we do on failure here? Ignore for now.
-                    let (_send_res, send_record_result_time) =
-                        measure!(record.sender.send(res), "send_record_result");
-                    timing.total_send_record_result_us += send_record_result_time.as_us();
-                    timing.num_hashes += 1; // note: may have also ticked inside record
+                    let (send_res, send_record_result_us) = measure_us!(record.sender.send(res));
+                    debug_assert!(send_res.is_ok(), "Record wasn't sent.");
 
-                    let new_record_result = record_receiver.try_recv();
-                    match new_record_result {
-                        Ok(new_record) => {
-                            // we already have second request to record, so record again while we still have the mutex
-                            record = new_record;
-                        }
-                        Err(_) => {
-                            break;
-                        }
+                    timing.total_send_record_result_us += send_record_result_us;
+                    timing.num_hashes += 1; // note: may have also ticked inside record
+                    if let Ok(new_record) = record_receiver.try_recv() {
+                        // we already have second request to record, so record again while we still have the mutex
+                        record = new_record;
+                    } else {
+                        break;
                     }
                 }
                 record_time.stop();
@@ -384,18 +377,18 @@ mod tests {
     use {
         super::*,
         rand::{thread_rng, Rng},
+        solana_clock::DEFAULT_HASHES_PER_TICK,
         solana_ledger::{
             blockstore::Blockstore,
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
-            get_tmp_ledger_path,
+            get_tmp_ledger_path_auto_delete,
             leader_schedule_cache::LeaderScheduleCache,
         },
         solana_measure::measure::Measure,
         solana_perf::test_tx::test_tx,
         solana_runtime::bank::Bank,
-        solana_sdk::{
-            clock, hash::hash, pubkey::Pubkey, timing, transaction::VersionedTransaction,
-        },
+        solana_sha256_hasher::hash,
+        solana_transaction::versioned::VersionedTransaction,
         std::{thread::sleep, time::Duration},
     };
 
@@ -404,173 +397,169 @@ mod tests {
     fn test_poh_service() {
         solana_logger::setup();
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
-        let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
+        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
         let prev_hash = bank.last_blockhash();
-        let ledger_path = get_tmp_ledger_path!();
-        {
-            let blockstore = Blockstore::open(&ledger_path)
-                .expect("Expected to be able to open database ledger");
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
 
-            let default_target_tick_duration =
-                timing::duration_as_us(&PohConfig::default().target_tick_duration);
-            let target_tick_duration = Duration::from_micros(default_target_tick_duration);
-            let poh_config = PohConfig {
-                hashes_per_tick: Some(clock::DEFAULT_HASHES_PER_TICK),
-                target_tick_duration,
-                target_tick_count: None,
-            };
-            let exit = Arc::new(AtomicBool::new(false));
+        let default_target_tick_duration =
+            PohConfig::default().target_tick_duration.as_micros() as u64;
+        let target_tick_duration = Duration::from_micros(default_target_tick_duration);
+        let poh_config = PohConfig {
+            hashes_per_tick: Some(DEFAULT_HASHES_PER_TICK),
+            target_tick_duration,
+            target_tick_count: None,
+        };
+        let exit = Arc::new(AtomicBool::new(false));
 
-            let ticks_per_slot = bank.ticks_per_slot();
-            let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
-            let blockstore = Arc::new(blockstore);
-            let (poh_recorder, entry_receiver, record_receiver) = PohRecorder::new(
-                bank.tick_height(),
-                prev_hash,
-                bank.clone(),
-                Some((4, 4)),
-                ticks_per_slot,
-                &Pubkey::default(),
-                &blockstore,
-                &leader_schedule_cache,
-                &poh_config,
-                exit.clone(),
-            );
-            let poh_recorder = Arc::new(RwLock::new(poh_recorder));
-            let ticks_per_slot = bank.ticks_per_slot();
-            let bank_slot = bank.slot();
+        let ticks_per_slot = bank.ticks_per_slot();
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
+        let blockstore = Arc::new(blockstore);
+        let (poh_recorder, entry_receiver, record_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            prev_hash,
+            bank.clone(),
+            Some((4, 4)),
+            ticks_per_slot,
+            blockstore,
+            &leader_schedule_cache,
+            &poh_config,
+            exit.clone(),
+        );
+        let poh_recorder = Arc::new(RwLock::new(poh_recorder));
+        let ticks_per_slot = bank.ticks_per_slot();
+        let bank_slot = bank.slot();
 
-            // specify RUN_TIME to run in a benchmark-like mode
-            // to calibrate batch size
-            let run_time = std::env::var("RUN_TIME")
-                .map(|x| x.parse().unwrap())
-                .unwrap_or(0);
-            let is_test_run = run_time == 0;
+        // specify RUN_TIME to run in a benchmark-like mode
+        // to calibrate batch size
+        let run_time = std::env::var("RUN_TIME")
+            .map(|x| x.parse().unwrap())
+            .unwrap_or(0);
+        let is_test_run = run_time == 0;
 
-            let entry_producer = {
-                let poh_recorder = poh_recorder.clone();
-                let exit = exit.clone();
+        let entry_producer = {
+            let poh_recorder = poh_recorder.clone();
+            let exit = exit.clone();
 
-                Builder::new()
-                    .name("solPohEntryProd".to_string())
-                    .spawn(move || {
-                        let now = Instant::now();
-                        let mut total_us = 0;
-                        let mut total_times = 0;
-                        let h1 = hash(b"hello world!");
-                        let tx = VersionedTransaction::from(test_tx());
-                        loop {
-                            // send some data
-                            let mut time = Measure::start("record");
-                            let _ = poh_recorder.write().unwrap().record(
-                                bank_slot,
-                                h1,
-                                vec![tx.clone()],
-                            );
-                            time.stop();
-                            total_us += time.as_us();
-                            total_times += 1;
-                            if is_test_run && thread_rng().gen_ratio(1, 4) {
-                                sleep(Duration::from_millis(200));
-                            }
-
-                            if exit.load(Ordering::Relaxed) {
-                                info!(
-                                    "spent:{}ms record: {}ms entries recorded: {}",
-                                    now.elapsed().as_millis(),
-                                    total_us / 1000,
-                                    total_times,
-                                );
-                                break;
-                            }
+            Builder::new()
+                .name("solPohEntryProd".to_string())
+                .spawn(move || {
+                    let now = Instant::now();
+                    let mut total_us = 0;
+                    let mut total_times = 0;
+                    let h1 = hash(b"hello world!");
+                    let tx = VersionedTransaction::from(test_tx());
+                    loop {
+                        // send some data
+                        let mut time = Measure::start("record");
+                        let _ =
+                            poh_recorder
+                                .write()
+                                .unwrap()
+                                .record(bank_slot, h1, vec![tx.clone()]);
+                        time.stop();
+                        total_us += time.as_us();
+                        total_times += 1;
+                        if is_test_run && thread_rng().gen_ratio(1, 4) {
+                            sleep(Duration::from_millis(200));
                         }
-                    })
-                    .unwrap()
-            };
 
-            let hashes_per_batch = std::env::var("HASHES_PER_BATCH")
-                .map(|x| x.parse().unwrap())
-                .unwrap_or(DEFAULT_HASHES_PER_BATCH);
-            let poh_service = PohService::new(
-                poh_recorder.clone(),
-                &poh_config,
-                &exit,
-                0,
-                DEFAULT_PINNED_CPU_CORE,
-                hashes_per_batch,
-                record_receiver,
-            );
-            poh_recorder.write().unwrap().set_bank(&bank, false);
-
-            // get some events
-            let mut hashes = 0;
-            let mut need_tick = true;
-            let mut need_entry = true;
-            let mut need_partial = true;
-            let mut num_ticks = 0;
-
-            let time = Instant::now();
-            while run_time != 0 || need_tick || need_entry || need_partial {
-                let (_bank, (entry, _tick_height)) = entry_receiver.recv().unwrap();
-
-                if entry.is_tick() {
-                    num_ticks += 1;
-                    assert!(
-                        entry.num_hashes <= poh_config.hashes_per_tick.unwrap(),
-                        "{} <= {}",
-                        entry.num_hashes,
-                        poh_config.hashes_per_tick.unwrap()
-                    );
-
-                    if entry.num_hashes == poh_config.hashes_per_tick.unwrap() {
-                        need_tick = false;
-                    } else {
-                        need_partial = false;
+                        if exit.load(Ordering::Relaxed) {
+                            info!(
+                                "spent:{}ms record: {}ms entries recorded: {}",
+                                now.elapsed().as_millis(),
+                                total_us / 1000,
+                                total_times,
+                            );
+                            break;
+                        }
                     }
+                })
+                .unwrap()
+        };
 
-                    hashes += entry.num_hashes;
+        let hashes_per_batch = std::env::var("HASHES_PER_BATCH")
+            .map(|x| x.parse().unwrap())
+            .unwrap_or(DEFAULT_HASHES_PER_BATCH);
+        let poh_service = PohService::new(
+            poh_recorder.clone(),
+            &poh_config,
+            exit.clone(),
+            0,
+            DEFAULT_PINNED_CPU_CORE,
+            hashes_per_batch,
+            record_receiver,
+        );
+        poh_recorder.write().unwrap().set_bank_for_test(bank);
 
-                    assert_eq!(hashes, poh_config.hashes_per_tick.unwrap());
+        // get some events
+        let mut hashes = 0;
+        let mut need_tick = true;
+        let mut need_entry = true;
+        let mut need_partial = true;
+        let mut num_ticks = 0;
 
-                    hashes = 0;
+        let time = Instant::now();
+        while run_time != 0 || need_tick || need_entry || need_partial {
+            let (_bank, (entry, _tick_height)) = entry_receiver.recv().unwrap();
+
+            if entry.is_tick() {
+                num_ticks += 1;
+                assert!(
+                    entry.num_hashes <= poh_config.hashes_per_tick.unwrap(),
+                    "{} <= {}",
+                    entry.num_hashes,
+                    poh_config.hashes_per_tick.unwrap()
+                );
+
+                if entry.num_hashes == poh_config.hashes_per_tick.unwrap() {
+                    need_tick = false;
                 } else {
-                    assert!(entry.num_hashes >= 1);
-                    need_entry = false;
-                    hashes += entry.num_hashes;
+                    need_partial = false;
                 }
 
-                if run_time != 0 {
-                    if time.elapsed().as_millis() > run_time {
-                        break;
-                    }
-                } else {
-                    assert!(
-                        time.elapsed().as_secs() < 60,
-                        "Test should not run for this long! {}s tick {} entry {} partial {}",
-                        time.elapsed().as_secs(),
-                        need_tick,
-                        need_entry,
-                        need_partial,
-                    );
-                }
+                hashes += entry.num_hashes;
+
+                assert_eq!(hashes, poh_config.hashes_per_tick.unwrap());
+
+                hashes = 0;
+            } else {
+                assert!(entry.num_hashes >= 1);
+                need_entry = false;
+                hashes += entry.num_hashes;
             }
-            info!(
-                "target_tick_duration: {} ticks_per_slot: {}",
-                poh_config.target_tick_duration.as_nanos(),
-                ticks_per_slot
-            );
-            let elapsed = time.elapsed();
-            info!(
-                "{} ticks in {}ms {}us/tick",
-                num_ticks,
-                elapsed.as_millis(),
-                elapsed.as_micros() / num_ticks
-            );
 
-            exit.store(true, Ordering::Relaxed);
-            poh_service.join().unwrap();
-            entry_producer.join().unwrap();
+            if run_time != 0 {
+                if time.elapsed().as_millis() > run_time {
+                    break;
+                }
+            } else {
+                assert!(
+                    time.elapsed().as_secs() < 60,
+                    "Test should not run for this long! {}s tick {} entry {} partial {}",
+                    time.elapsed().as_secs(),
+                    need_tick,
+                    need_entry,
+                    need_partial,
+                );
+            }
         }
-        Blockstore::destroy(&ledger_path).unwrap();
+        info!(
+            "target_tick_duration: {} ticks_per_slot: {}",
+            poh_config.target_tick_duration.as_nanos(),
+            ticks_per_slot
+        );
+        let elapsed = time.elapsed();
+        info!(
+            "{} ticks in {}ms {}us/tick",
+            num_ticks,
+            elapsed.as_millis(),
+            elapsed.as_micros() / num_ticks
+        );
+
+        exit.store(true, Ordering::Relaxed);
+        poh_service.join().unwrap();
+        entry_producer.join().unwrap();
     }
 }

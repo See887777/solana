@@ -1,3 +1,4 @@
+#![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 pub mod cuda_runtime;
 pub mod data_budget;
 pub mod deduper;
@@ -7,6 +8,7 @@ pub mod perf_libs;
 pub mod recycler;
 pub mod recycler_cache;
 pub mod sigverify;
+#[cfg(feature = "dev-context-only-utils")]
 pub mod test_tx;
 pub mod thread;
 
@@ -18,10 +20,14 @@ extern crate log;
 
 #[cfg(test)]
 #[macro_use]
-extern crate matches;
+extern crate assert_matches;
 
 #[macro_use]
 extern crate solana_metrics;
+
+#[cfg_attr(feature = "frozen-abi", macro_use)]
+#[cfg(feature = "frozen-abi")]
+extern crate solana_frozen_abi_macro;
 
 fn is_rosetta_emulated() -> bool {
     #[cfg(target_os = "macos")]

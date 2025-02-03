@@ -1,89 +1,161 @@
 [package]
 name = "solana-program"
-version = "1.16.0"
 description = "Solana Program"
-authors = ["Solana Labs Maintainers <maintainers@solanalabs.com>"]
-repository = "https://github.com/solana-labs/solana"
-homepage = "https://solana.com/"
 documentation = "https://docs.rs/solana-program"
 readme = "README.md"
-license = "Apache-2.0"
-edition = "2021"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+rust-version = "1.79.0"                          # solana platform-tools rust version
 
 [dependencies]
-bincode = "1.3.1"
-blake3 = { version = "1.3.1", features = ["digest", "traits-preview"] }
-borsh = "0.9.3"
-borsh-derive = "0.9.1"
-bs58 = "0.4.0"
-bv = { version = "0.11.1", features = ["serde"] }
-bytemuck = { version = "1.8.0", features = ["derive"] }
-itertools =  "0.10.5"
-lazy_static = "1.4.0"
-log = "0.4.17"
-memoffset = "0.8"
-num-derive = "0.3"
-num-traits = { version = "0.2", default-features = true, features = ["i128", "std"] }
-rustversion = "1.0.11"
-serde = { version = "1.0", features = ["derive"] }
-serde_bytes = "0.11"
-serde_derive = "1.0"
-serde_json = "1.0"
-sha2 = "0.10.6"
-sha3 = "0.10.0"
-solana-frozen-abi = { path = "../../frozen-abi", version = "=1.16.0" }
-solana-frozen-abi-macro = { path = "../../frozen-abi/macro", version = "=1.16.0" }
-solana-sdk-macro = { path = "../macro", version = "=1.16.0" }
-thiserror = "1.0"
+bincode = { workspace = true }
+blake3 = { workspace = true, features = ["traits-preview"] }
+borsh = { workspace = true, optional = true }
+borsh0-10 = { workspace = true, optional = true }
+bs58 = { workspace = true, features = ["alloc"] }
+bytemuck = { workspace = true }
+lazy_static = { workspace = true }
+log = { workspace = true }
+memoffset = { workspace = true }
+num-derive = { workspace = true }
+num-traits = { workspace = true, features = ["i128"] }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_derive = { workspace = true }
+solana-account-info = { workspace = true, features = ["bincode"] }
+solana-address-lookup-table-interface = { workspace = true, features = ["bincode", "bytemuck"] }
+solana-atomic-u64 = { workspace = true }
+solana-big-mod-exp = { workspace = true }
+solana-bincode = { workspace = true }
+solana-blake3-hasher = { workspace = true, features = ["blake3"] }
+solana-borsh = { workspace = true, optional = true }
+solana-clock = { workspace = true, features = ["serde", "sysvar"] }
+solana-cpi = { workspace = true }
+solana-decode-error = { workspace = true }
+solana-epoch-rewards = { workspace = true, features = ["serde", "sysvar"] }
+solana-epoch-schedule = { workspace = true, features = ["serde", "sysvar"] }
+solana-feature-gate-interface = { workspace = true, features = ["bincode"] }
+solana-fee-calculator = { workspace = true, features = ["serde"] }
+solana-frozen-abi = { workspace = true, optional = true, features = ["frozen-abi"] }
+solana-frozen-abi-macro = { workspace = true, optional = true, features = ["frozen-abi"] }
+solana-hash = { workspace = true, features = [
+    "bytemuck",
+    "serde",
+    "std",
+] }
+solana-instruction = { workspace = true, default-features = false, features = [
+    "bincode",
+    "serde",
+    "std",
+] }
+solana-instructions-sysvar = { workspace = true }
+solana-keccak-hasher = { workspace = true, features = ["sha3"] }
+solana-last-restart-slot = { workspace = true, features = ["serde", "sysvar"] }
+solana-loader-v2-interface = { workspace = true, features = ["bincode"] }
+solana-loader-v3-interface = { workspace = true, features = ["bincode"] }
+solana-loader-v4-interface = { workspace = true, features = ["bincode"] }
+solana-message = { workspace = true, features = ["bincode", "blake3"] }
+solana-msg = { workspace = true }
+solana-native-token = { workspace = true }
+solana-nonce = { workspace = true, features = ["serde"] }
+solana-program-entrypoint = { workspace = true }
+solana-program-error = { workspace = true, features = ["serde"] }
+solana-program-memory = { workspace = true }
+solana-program-option = { workspace = true }
+solana-program-pack = { workspace = true }
+solana-pubkey = { workspace = true, features = ["bytemuck", "curve25519", "serde", "std"] }
+solana-rent = { workspace = true, features = ["serde", "sysvar"] }
+solana-sanitize = { workspace = true }
+solana-sdk-ids = { workspace = true }
+solana-sdk-macro = { workspace = true }
+solana-secp256k1-recover = { workspace = true }
+solana-serde-varint = { workspace = true }
+solana-serialize-utils = { workspace = true }
+solana-sha256-hasher = { workspace = true, features = ["sha2"] }
+solana-short-vec = { workspace = true }
+solana-slot-hashes = { workspace = true, features = ["serde", "sysvar"] }
+solana-slot-history = { workspace = true, features = ["serde", "sysvar"] }
+solana-stable-layout = { workspace = true }
+solana-stake-interface = { workspace = true, features = ["bincode"] }
+solana-system-interface = { workspace = true, features = ["bincode"] }
+solana-sysvar = { workspace = true, features = ["bincode", "bytemuck"] }
+solana-sysvar-id = { workspace = true }
+solana-vote-interface = { workspace = true, features = ["bincode"] }
+thiserror = { workspace = true }
+
+# This is currently needed to build on-chain programs reliably.
+# Borsh 0.10 may pull in hashbrown 0.13, which uses ahash 0.8, which uses
+# getrandom 0.2 underneath. This explicit dependency allows for no-std if cargo
+# upgrades Borsh's dependency to hashbrown 0.13.
+# Remove this once borsh 0.11 or 1.0 is released, which correctly declares the
+# hashbrown dependency as optional.
+[target.'cfg(target_os = "solana")'.dependencies]
+getrandom = { workspace = true, features = ["custom"] }
+solana-define-syscall = { workspace = true }
 
 [target.'cfg(not(target_os = "solana"))'.dependencies]
-ark-bn254 = "0.3.0"
-ark-ec = "0.3.0"
-ark-ff = "0.3.0"
-array-bytes = "=1.4.1"
-bitflags = "1.3.1"
-base64 = { version = "0.13", features = ["alloc", "std"] }
-curve25519-dalek = { version = "3.2.1", features = ["serde"] }
-itertools = "0.10.5"
-libc = { version = "0.2.126", features = ["extra_traits"] }
-libsecp256k1 = "0.6.0"
-num-bigint = "0.4.3"
-rand = "0.7"
-rand_chacha = { version = "0.2.2", default-features = true, features = ["simd", "std"] }
-tiny-bip39 = "0.8.2"
-wasm-bindgen = "0.2"
-zeroize = { version = "1.3", default-features = true, features = ["zeroize_derive"] }
+num-bigint = { workspace = true }
+rand = { workspace = true }
+solana-example-mocks = { workspace = true }
 
 [target.'cfg(not(target_os = "solana"))'.dev-dependencies]
-solana-logger = { path = "../../logger", version = "=1.16.0" }
+arbitrary = { workspace = true, features = ["derive"] }
+solana-logger = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-console_error_panic_hook = "0.1.7"
-console_log = "0.2.0"
-js-sys = "0.3.55"
-getrandom = { version = "0.2", features = ["js", "wasm-bindgen"] }
-
-[target.'cfg(not(target_pointer_width = "64"))'.dependencies]
-parking_lot = "0.12"
+console_error_panic_hook = { workspace = true }
+console_log = { workspace = true }
+getrandom = { workspace = true, features = ["js", "wasm-bindgen"] }
+wasm-bindgen = { workspace = true }
 
 [dev-dependencies]
-anyhow = "1.0.58"
-assert_matches = "1.5.0"
-bincode = "1.3.1"
-borsh = "0.9.3"
-borsh-derive = "0.9.1"
-serde_json = "1.0.56"
-static_assertions = "1.1.0"
-
-[build-dependencies]
-cc = { version = "1.0.79", features = ["jobserver", "parallel"] }
-rustc_version = "0.4"
+array-bytes = { workspace = true }
+assert_matches = { workspace = true }
+itertools = { workspace = true }
+serde_json = { workspace = true }
+solana-pubkey = { workspace = true, features = ["dev-context-only-utils"] }
+solana-sysvar = { workspace = true, features = ["dev-context-only-utils"] }
 
 [package.metadata.docs.rs]
-targets = ["x86_64-unknown-linux-gnu"]
+targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
+all-features = true
+rustdoc-args = ["--cfg=docsrs"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+default = ["borsh"]
+borsh = [
+    "dep:borsh",
+    "dep:borsh0-10",
+    "dep:solana-borsh",
+    "solana-hash/borsh",
+    "solana-instruction/borsh",
+    "solana-program-error/borsh",
+    "solana-pubkey/borsh",
+    "solana-stake-interface/borsh",
+]
+dev-context-only-utils = []
+frozen-abi = [
+    "dep:solana-frozen-abi",
+    "dep:solana-frozen-abi-macro",
+    "solana-epoch-rewards/frozen-abi",
+    "solana-epoch-schedule/frozen-abi",
+    "solana-fee-calculator/frozen-abi",
+    "solana-hash/frozen-abi",
+    "solana-instruction/frozen-abi",
+    "solana-message/frozen-abi",
+    "solana-pubkey/frozen-abi",
+    "solana-rent/frozen-abi",
+    "solana-short-vec/frozen-abi",
+    "solana-stake-interface/frozen-abi",
+    "solana-sysvar/frozen-abi"
+]
+
+[lints]
+workspace = true

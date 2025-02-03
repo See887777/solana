@@ -8,17 +8,18 @@ use {
         TransactionSimulationDetails, TransactionStatus,
     },
     solana_client::connection_cache::ConnectionCache,
+    solana_feature_set::{move_precompile_verification_to_svm, FeatureSet},
     solana_runtime::{
-        bank::{Bank, TransactionExecutionResult, TransactionSimulationResult},
+        bank::{Bank, TransactionSimulationResult},
         bank_forks::BankForks,
         commitment::BlockCommitmentCache,
+        verify_precompiles::verify_precompiles,
     },
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_sdk::{
         account::Account,
         clock::Slot,
         commitment_config::CommitmentLevel,
-        feature_set::FeatureSet,
-        fee_calculator::FeeCalculator,
         hash::Hash,
         message::{Message, SanitizedMessage},
         pubkey::Pubkey,
@@ -30,10 +31,9 @@ use {
         tpu_info::NullTpuInfo,
     },
     std::{
-        convert::TryFrom,
         io,
         net::{Ipv4Addr, SocketAddr},
-        sync::{Arc, RwLock},
+        sync::{atomic::AtomicBool, Arc, RwLock},
         thread::Builder,
         time::Duration,
     },
@@ -85,8 +85,18 @@ impl BanksServer {
                 .into_iter()
                 .map(|info| deserialize(&info.wire_transaction).unwrap())
                 .collect();
-            let bank = bank_forks.read().unwrap().working_bank();
-            let _ = bank.try_process_transactions(transactions.iter());
+            loop {
+                let bank = bank_forks.read().unwrap().working_bank();
+                // bank forks lock released, now verify bank hasn't been frozen yet
+                // in the mean-time the bank can not be frozen until this tx batch
+                // has been processed
+                let lock = bank.freeze_lock();
+                if *lock == Hash::default() {
+                    let _ = bank.try_process_entry_transactions(transactions);
+                    // break out of inner loop and release bank freeze lock
+                    break;
+                }
+            }
         }
     }
 
@@ -155,7 +165,13 @@ fn verify_transaction(
     feature_set: &Arc<FeatureSet>,
 ) -> transaction::Result<()> {
     transaction.verify()?;
-    transaction.verify_precompiles(feature_set)?;
+
+    let move_precompile_verification_to_svm =
+        feature_set.is_active(&move_precompile_verification_to_svm::id());
+    if !move_precompile_verification_to_svm {
+        verify_precompiles(transaction, feature_set)?;
+    }
+
     Ok(())
 }
 
@@ -163,12 +179,12 @@ fn simulate_transaction(
     bank: &Bank,
     transaction: VersionedTransaction,
 ) -> BanksTransactionResultWithSimulation {
-    let sanitized_transaction = match SanitizedTransaction::try_create(
+    let sanitized_transaction = match RuntimeTransaction::try_create(
         transaction,
         MessageHash::Compute,
         Some(false), // is_simple_vote_tx
         bank,
-        true, // require_static_program_ids
+        bank.get_reserved_account_keys(),
     ) {
         Err(err) => {
             return BanksTransactionResultWithSimulation {
@@ -184,11 +200,14 @@ fn simulate_transaction(
         post_simulation_accounts: _,
         units_consumed,
         return_data,
-    } = bank.simulate_transaction_unchecked(sanitized_transaction);
+        inner_instructions,
+    } = bank.simulate_transaction_unchecked(&sanitized_transaction, true);
+
     let simulation_details = TransactionSimulationDetails {
         logs,
         units_consumed,
         return_data,
+        inner_instructions,
     };
     BanksTransactionResultWithSimulation {
         result: Some(result),
@@ -207,7 +226,7 @@ impl Banks for BanksServer {
             .root_bank()
             .get_blockhash_last_valid_block_height(blockhash)
             .unwrap();
-        let signature = transaction.signatures.get(0).cloned().unwrap_or_default();
+        let signature = transaction.signatures.first().cloned().unwrap_or_default();
         let info = TransactionInfo::new(
             signature,
             serialize(&transaction).unwrap(),
@@ -217,24 +236,6 @@ impl Banks for BanksServer {
             None,
         );
         self.transaction_sender.send(info).unwrap();
-    }
-
-    async fn get_fees_with_commitment_and_context(
-        self,
-        _: Context,
-        commitment: CommitmentLevel,
-    ) -> (FeeCalculator, Hash, u64) {
-        let bank = self.bank(commitment);
-        let blockhash = bank.last_blockhash();
-        let lamports_per_signature = bank.get_lamports_per_signature();
-        let last_valid_block_height = bank
-            .get_blockhash_last_valid_block_height(&blockhash)
-            .unwrap();
-        (
-            FeeCalculator::new(lamports_per_signature),
-            blockhash,
-            last_valid_block_height,
-        )
     }
 
     async fn get_transaction_status_with_context(
@@ -251,7 +252,7 @@ impl Banks for BanksServer {
             optimistically_confirmed_bank.get_signature_status_slot(&signature);
 
         let confirmations = if r_block_commitment_cache.root() >= slot
-            && r_block_commitment_cache.highest_confirmed_root() >= slot
+            && r_block_commitment_cache.highest_super_majority_root() >= slot
         {
             None
         } else {
@@ -320,7 +321,7 @@ impl Banks for BanksServer {
             MessageHash::Compute,
             Some(false), // is_simple_vote_tx
             bank.as_ref(),
-            true, // require_static_program_ids
+            bank.get_reserved_account_keys(),
         ) {
             Ok(tx) => tx,
             Err(err) => return Some(Err(err)),
@@ -356,20 +357,18 @@ impl Banks for BanksServer {
     ) -> BanksTransactionResultWithMetadata {
         let bank = self.bank_forks.read().unwrap().working_bank();
         match bank.process_transaction_with_metadata(transaction) {
-            TransactionExecutionResult::NotExecuted(error) => BanksTransactionResultWithMetadata {
+            Err(error) => BanksTransactionResultWithMetadata {
                 result: Err(error),
                 metadata: None,
             },
-            TransactionExecutionResult::Executed { details, .. } => {
-                BanksTransactionResultWithMetadata {
-                    result: details.status,
-                    metadata: Some(TransactionMetadata {
-                        compute_units_consumed: details.executed_units,
-                        log_messages: details.log_messages.unwrap_or_default(),
-                        return_data: details.return_data,
-                    }),
-                }
-            }
+            Ok(details) => BanksTransactionResultWithMetadata {
+                result: details.status,
+                metadata: Some(TransactionMetadata {
+                    compute_units_consumed: details.executed_units,
+                    log_messages: details.log_messages.unwrap_or_default(),
+                    return_data: details.return_data,
+                }),
+            },
         }
     }
 
@@ -402,11 +401,13 @@ impl Banks for BanksServer {
     async fn get_fee_for_message_with_commitment_and_context(
         self,
         _: Context,
-        commitment: CommitmentLevel,
         message: Message,
+        commitment: CommitmentLevel,
     ) -> Option<u64> {
         let bank = self.bank(commitment);
-        let sanitized_message = SanitizedMessage::try_from(message).ok()?;
+        let sanitized_message =
+            SanitizedMessage::try_from_legacy_message(message, bank.get_reserved_account_keys())
+                .ok()?;
         bank.get_fee_for_message(&sanitized_message)
     }
 }
@@ -433,6 +434,7 @@ pub async fn start_tcp_server(
     bank_forks: Arc<RwLock<BankForks>>,
     block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
     connection_cache: Arc<ConnectionCache>,
+    exit: Arc<AtomicBool>,
 ) -> io::Result<()> {
     // Note: These settings are copied straight from the tarpc example.
     let server = tcp::listen(listen_addr, Bincode::default)
@@ -460,6 +462,7 @@ pub async fn start_tcp_server(
                 &connection_cache,
                 5_000,
                 0,
+                exit.clone(),
             );
 
             let server = BanksServer::new(

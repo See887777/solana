@@ -23,9 +23,11 @@ fi
 PATH=$PWD/target/$profile:$PATH
 
 ok=true
-for program in solana-{faucet,genesis,keygen,validator}; do
+for program in solana-{faucet,genesis,keygen}; do
   $program -V || ok=false
 done
+agave-validator -V || ok=false
+
 $ok || {
   echo
   echo "Unable to locate required programs.  Try building them first with:"
@@ -35,7 +37,7 @@ $ok || {
   exit 1
 }
 
-export RUST_LOG=${RUST_LOG:-solana=info,solana_runtime::message_processor=debug} # if RUST_LOG is unset, default to info
+export RUST_LOG=${RUST_LOG:-solana=info,agave=info,solana_runtime::message_processor=debug} # if RUST_LOG is unset, default to info
 export RUST_BACKTRACE=1
 dataDir=$PWD/config/"$(basename "$0" .sh)"
 ledgerDir=$PWD/config/ledger
@@ -110,13 +112,12 @@ args=(
   --enable-rpc-transaction-history
   --enable-extended-tx-metadata-storage
   --init-complete-file "$dataDir"/init-completed
-  --snapshot-compression none
   --require-tower
   --no-wait-for-vote-to-start-leader
   --no-os-network-limits-test
 )
 # shellcheck disable=SC2086
-solana-validator "${args[@]}" $SOLANA_RUN_SH_VALIDATOR_ARGS &
+agave-validator "${args[@]}" $SOLANA_RUN_SH_VALIDATOR_ARGS &
 validator=$!
 
 wait "$validator"

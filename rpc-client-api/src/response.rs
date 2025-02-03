@@ -1,17 +1,14 @@
 use {
     crate::client_error,
     serde::{Deserialize, Deserializer, Serialize, Serializer},
-    solana_account_decoder::{parse_token::UiTokenAmount, UiAccount},
-    solana_sdk::{
-        clock::{Epoch, Slot, UnixTimestamp},
-        fee_calculator::{FeeCalculator, FeeRateGovernor},
-        hash::Hash,
-        inflation::Inflation,
-        transaction::{Result, TransactionError},
-    },
-    solana_transaction_status::{
+    solana_account_decoder_client_types::{token::UiTokenAmount, UiAccount},
+    solana_clock::{Epoch, Slot, UnixTimestamp},
+    solana_fee_calculator::{FeeCalculator, FeeRateGovernor},
+    solana_inflation::Inflation,
+    solana_transaction_error::{TransactionError, TransactionResult as Result},
+    solana_transaction_status_client_types::{
         ConfirmedTransactionStatusWithSignature, TransactionConfirmationStatus, UiConfirmedBlock,
-        UiTransactionReturnData,
+        UiInnerInstructions, UiTransactionReturnData,
     },
     std::{collections::HashMap, fmt, net::SocketAddr, str::FromStr},
     thiserror::Error,
@@ -116,31 +113,6 @@ pub struct RpcBlockhashFeeCalculator {
 #[serde(rename_all = "camelCase")]
 pub struct RpcBlockhash {
     pub blockhash: String,
-    pub last_valid_block_height: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RpcFees {
-    pub blockhash: String,
-    pub fee_calculator: FeeCalculator,
-    pub last_valid_slot: Slot,
-    pub last_valid_block_height: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct DeprecatedRpcFees {
-    pub blockhash: String,
-    pub fee_calculator: FeeCalculator,
-    pub last_valid_slot: Slot,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Fees {
-    pub blockhash: Hash,
-    pub fee_calculator: FeeCalculator,
     pub last_valid_block_height: u64,
 }
 
@@ -294,8 +266,20 @@ pub struct RpcContactInfo {
     pub pubkey: String,
     /// Gossip port
     pub gossip: Option<SocketAddr>,
-    /// Tpu port
+    /// Tvu UDP port
+    pub tvu: Option<SocketAddr>,
+    /// Tpu UDP port
     pub tpu: Option<SocketAddr>,
+    /// Tpu QUIC port
+    pub tpu_quic: Option<SocketAddr>,
+    /// Tpu UDP forwards port
+    pub tpu_forwards: Option<SocketAddr>,
+    /// Tpu QUIC forwards port
+    pub tpu_forwards_quic: Option<SocketAddr>,
+    /// Tpu UDP vote port
+    pub tpu_vote: Option<SocketAddr>,
+    /// Server repair UDP port
+    pub serve_repair: Option<SocketAddr>,
     /// JSON RPC port
     pub rpc: Option<SocketAddr>,
     /// WebSocket PubSub port
@@ -421,6 +405,8 @@ pub struct RpcSimulateTransactionResult {
     pub accounts: Option<Vec<Option<UiAccount>>>,
     pub units_consumed: Option<u64>,
     pub return_data: Option<UiTransactionReturnData>,
+    pub inner_instructions: Option<Vec<UiInnerInstructions>>,
+    pub replacement_blockhash: Option<RpcBlockhash>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -453,14 +439,6 @@ pub enum StakeActivationState {
     Active,
     Deactivating,
     Inactive,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RpcStakeActivation {
-    pub state: StakeActivationState,
-    pub active: u64,
-    pub inactive: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

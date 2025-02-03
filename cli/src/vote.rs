@@ -5,15 +5,18 @@ use {
             log_instruction_custom_error, CliCommand, CliCommandInfo, CliConfig, CliError,
             ProcessResult,
         },
-        compute_unit_price::WithComputeUnitPrice,
+        compute_budget::{
+            simulate_and_update_compute_unit_limit, ComputeUnitConfig, WithComputeUnitConfig,
+        },
         memo::WithMemo,
         nonce::check_nonce_account,
         spend_utils::{resolve_spend_tx_and_check_account_balances, SpendAmount},
         stake::check_current_authority,
     },
     clap::{value_t_or_exit, App, Arg, ArgMatches, SubCommand},
+    solana_account::Account,
     solana_clap_utils::{
-        compute_unit_price::{compute_unit_price_arg, COMPUTE_UNIT_PRICE_ARG},
+        compute_budget::{compute_unit_price_arg, ComputeUnitLimit, COMPUTE_UNIT_PRICE_ARG},
         fee_payer::{fee_payer_arg, FEE_PAYER_ARG},
         input_parsers::*,
         input_validators::*,
@@ -23,24 +26,27 @@ use {
         offline::*,
     },
     solana_cli_output::{
-        return_signers_with_config, CliEpochVotingHistory, CliLockout, CliVoteAccount,
+        return_signers_with_config, CliEpochVotingHistory, CliLandedVote, CliVoteAccount,
         ReturnSignersConfig,
     },
+    solana_commitment_config::CommitmentConfig,
+    solana_message::Message,
+    solana_native_token::lamports_to_sol,
+    solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::config::RpcGetVoteAccountsConfig,
     solana_rpc_client_nonce_utils::blockhash_query::BlockhashQuery,
-    solana_sdk::{
-        account::Account, commitment_config::CommitmentConfig, message::Message,
-        native_token::lamports_to_sol, pubkey::Pubkey, system_instruction::SystemError,
-        transaction::Transaction,
-    },
+    solana_system_interface::error::SystemError,
+    solana_transaction::Transaction,
     solana_vote_program::{
         vote_error::VoteError,
-        vote_instruction::{self, withdraw},
-        vote_state::{VoteAuthorize, VoteInit, VoteState},
+        vote_instruction::{self, withdraw, CreateVoteAccountConfig},
+        vote_state::{
+            VoteAuthorize, VoteInit, VoteState, VoteStateVersions, VOTE_CREDITS_MAXIMUM_PER_SLOT,
+        },
     },
-    std::sync::Arc,
+    std::rc::Rc,
 };
 
 pub trait VoteSubCommands {
@@ -70,15 +76,15 @@ impl VoteSubCommands for App<'_, '_> {
                         .validator(is_valid_signer)
                         .help("Keypair of validator that will vote with this account"),
                 )
-                .arg(
-                    pubkey!(Arg::with_name("authorized_withdrawer")
+                .arg(pubkey!(
+                    Arg::with_name("authorized_withdrawer")
                         .index(3)
                         .value_name("WITHDRAWER_PUBKEY")
                         .takes_value(true)
                         .required(true)
                         .long("authorized-withdrawer"),
-                        "Public key of the authorized withdrawer")
-                )
+                    "Authorized withdrawer."
+                ))
                 .arg(
                     Arg::with_name("commission")
                         .long("commission")
@@ -87,43 +93,48 @@ impl VoteSubCommands for App<'_, '_> {
                         .default_value("100")
                         .help("The commission taken on reward redemption (0-100)"),
                 )
-                .arg(
-                    pubkey!(Arg::with_name("authorized_voter")
+                .arg(pubkey!(
+                    Arg::with_name("authorized_voter")
                         .long("authorized-voter")
                         .value_name("VOTER_PUBKEY"),
-                        "Public key of the authorized voter [default: validator identity pubkey]. "),
-                )
+                    "Authorized voter [default: validator identity pubkey]."
+                ))
                 .arg(
                     Arg::with_name("allow_unsafe_authorized_withdrawer")
                         .long("allow-unsafe-authorized-withdrawer")
                         .takes_value(false)
-                        .help("Allow an authorized withdrawer pubkey to be identical to the validator identity \
-                               account pubkey or vote account pubkey, which is normally an unsafe \
-                               configuration and should be avoided."),
+                        .help(
+                            "Allow an authorized withdrawer pubkey to be identical to the \
+                             validator identity account pubkey or vote account pubkey, which is \
+                             normally an unsafe configuration and should be avoided.",
+                        ),
                 )
                 .arg(
                     Arg::with_name("seed")
                         .long("seed")
                         .value_name("STRING")
                         .takes_value(true)
-                        .help("Seed for address generation; if specified, the resulting account will be at a derived address of the VOTE ACCOUNT pubkey")
+                        .help(
+                            "Seed for address generation; if specified, the resulting account \
+                             will be at a derived address of the VOTE ACCOUNT pubkey",
+                        ),
                 )
                 .offline_args()
                 .nonce_args(false)
                 .arg(fee_payer_arg())
                 .arg(memo_arg())
-                .arg(compute_unit_price_arg())
+                .arg(compute_unit_price_arg()),
         )
         .subcommand(
             SubCommand::with_name("vote-authorize-voter")
                 .about("Authorize a new vote signing keypair for the given vote account")
-                .arg(
-                    pubkey!(Arg::with_name("vote_account_pubkey")
+                .arg(pubkey!(
+                    Arg::with_name("vote_account_pubkey")
                         .index(1)
                         .value_name("VOTE_ACCOUNT_ADDRESS")
                         .required(true),
-                        "Vote account in which to set the authorized voter. "),
-                )
+                    "Vote account in which to set the authorized voter."
+                ))
                 .arg(
                     Arg::with_name("authorized")
                         .index(2)
@@ -132,29 +143,29 @@ impl VoteSubCommands for App<'_, '_> {
                         .validator(is_valid_signer)
                         .help("Current authorized vote signer."),
                 )
-                .arg(
-                    pubkey!(Arg::with_name("new_authorized_pubkey")
+                .arg(pubkey!(
+                    Arg::with_name("new_authorized_pubkey")
                         .index(3)
                         .value_name("NEW_AUTHORIZED_PUBKEY")
                         .required(true),
-                        "New authorized vote signer. "),
-                )
+                    "New authorized vote signer."
+                ))
                 .offline_args()
                 .nonce_args(false)
                 .arg(fee_payer_arg())
                 .arg(memo_arg())
-                .arg(compute_unit_price_arg())
+                .arg(compute_unit_price_arg()),
         )
         .subcommand(
             SubCommand::with_name("vote-authorize-withdrawer")
                 .about("Authorize a new withdraw signing keypair for the given vote account")
-                .arg(
-                    pubkey!(Arg::with_name("vote_account_pubkey")
+                .arg(pubkey!(
+                    Arg::with_name("vote_account_pubkey")
                         .index(1)
                         .value_name("VOTE_ACCOUNT_ADDRESS")
                         .required(true),
-                        "Vote account in which to set the authorized withdrawer. "),
-                )
+                    "Vote account in which to set the authorized withdrawer."
+                ))
                 .arg(
                     Arg::with_name("authorized")
                         .index(2)
@@ -163,30 +174,32 @@ impl VoteSubCommands for App<'_, '_> {
                         .validator(is_valid_signer)
                         .help("Current authorized withdrawer."),
                 )
-                .arg(
-                    pubkey!(Arg::with_name("new_authorized_pubkey")
+                .arg(pubkey!(
+                    Arg::with_name("new_authorized_pubkey")
                         .index(3)
                         .value_name("AUTHORIZED_PUBKEY")
                         .required(true),
-                        "New authorized withdrawer. "),
-                )
+                    "New authorized withdrawer."
+                ))
                 .offline_args()
                 .nonce_args(false)
                 .arg(fee_payer_arg())
                 .arg(memo_arg())
-                .arg(compute_unit_price_arg())
+                .arg(compute_unit_price_arg()),
         )
         .subcommand(
             SubCommand::with_name("vote-authorize-voter-checked")
-                .about("Authorize a new vote signing keypair for the given vote account, \
-                    checking the new authority as a signer")
-                .arg(
-                    pubkey!(Arg::with_name("vote_account_pubkey")
+                .about(
+                    "Authorize a new vote signing keypair for the given vote account, checking \
+                     the new authority as a signer",
+                )
+                .arg(pubkey!(
+                    Arg::with_name("vote_account_pubkey")
                         .index(1)
                         .value_name("VOTE_ACCOUNT_ADDRESS")
                         .required(true),
-                        "Vote account in which to set the authorized voter. "),
-                )
+                    "Vote account in which to set the authorized voter."
+                ))
                 .arg(
                     Arg::with_name("authorized")
                         .index(2)
@@ -207,19 +220,21 @@ impl VoteSubCommands for App<'_, '_> {
                 .nonce_args(false)
                 .arg(fee_payer_arg())
                 .arg(memo_arg())
-                .arg(compute_unit_price_arg())
+                .arg(compute_unit_price_arg()),
         )
         .subcommand(
             SubCommand::with_name("vote-authorize-withdrawer-checked")
-                .about("Authorize a new withdraw signing keypair for the given vote account, \
-                    checking the new authority as a signer")
-                .arg(
-                    pubkey!(Arg::with_name("vote_account_pubkey")
+                .about(
+                    "Authorize a new withdraw signing keypair for the given vote account, \
+                     checking the new authority as a signer",
+                )
+                .arg(pubkey!(
+                    Arg::with_name("vote_account_pubkey")
                         .index(1)
                         .value_name("VOTE_ACCOUNT_ADDRESS")
                         .required(true),
-                        "Vote account in which to set the authorized withdrawer. "),
-                )
+                    "Vote account in which to set the authorized withdrawer."
+                ))
                 .arg(
                     Arg::with_name("authorized")
                         .index(2)
@@ -240,18 +255,18 @@ impl VoteSubCommands for App<'_, '_> {
                 .nonce_args(false)
                 .arg(fee_payer_arg())
                 .arg(memo_arg())
-                .arg(compute_unit_price_arg())
+                .arg(compute_unit_price_arg()),
         )
         .subcommand(
             SubCommand::with_name("vote-update-validator")
                 .about("Update the vote account's validator identity")
-                .arg(
-                    pubkey!(Arg::with_name("vote_account_pubkey")
+                .arg(pubkey!(
+                    Arg::with_name("vote_account_pubkey")
                         .index(1)
                         .value_name("VOTE_ACCOUNT_ADDRESS")
                         .required(true),
-                        "Vote account to update. "),
-                )
+                    "Vote account to update."
+                ))
                 .arg(
                     Arg::with_name("new_identity_account")
                         .index(2)
@@ -274,18 +289,18 @@ impl VoteSubCommands for App<'_, '_> {
                 .nonce_args(false)
                 .arg(fee_payer_arg())
                 .arg(memo_arg())
-                .arg(compute_unit_price_arg())
+                .arg(compute_unit_price_arg()),
         )
         .subcommand(
             SubCommand::with_name("vote-update-commission")
                 .about("Update the vote account's commission")
-                .arg(
-                    pubkey!(Arg::with_name("vote_account_pubkey")
+                .arg(pubkey!(
+                    Arg::with_name("vote_account_pubkey")
                         .index(1)
                         .value_name("VOTE_ACCOUNT_ADDRESS")
                         .required(true),
-                        "Vote account to update. "),
-                )
+                    "Vote account to update."
+                ))
                 .arg(
                     Arg::with_name("commission")
                         .index(2)
@@ -293,7 +308,7 @@ impl VoteSubCommands for App<'_, '_> {
                         .takes_value(true)
                         .required(true)
                         .validator(is_valid_percentage)
-                        .help("The new commission")
+                        .help("The new commission"),
                 )
                 .arg(
                     Arg::with_name("authorized_withdrawer")
@@ -308,19 +323,19 @@ impl VoteSubCommands for App<'_, '_> {
                 .nonce_args(false)
                 .arg(fee_payer_arg())
                 .arg(memo_arg())
-                .arg(compute_unit_price_arg())
+                .arg(compute_unit_price_arg()),
         )
         .subcommand(
             SubCommand::with_name("vote-account")
                 .about("Show the contents of a vote account")
                 .alias("show-vote-account")
-                .arg(
-                    pubkey!(Arg::with_name("vote_account_pubkey")
+                .arg(pubkey!(
+                    Arg::with_name("vote_account_pubkey")
                         .index(1)
                         .value_name("VOTE_ACCOUNT_ADDRESS")
                         .required(true),
-                        "Vote account pubkey. "),
-                )
+                    "Vote account."
+                ))
                 .arg(
                     Arg::with_name("lamports")
                         .long("lamports")
@@ -334,33 +349,50 @@ impl VoteSubCommands for App<'_, '_> {
                         .help("Display inflation rewards"),
                 )
                 .arg(
+                    Arg::with_name("csv")
+                        .long("csv")
+                        .takes_value(false)
+                        .help("Format rewards in a CSV table"),
+                )
+                .arg(
+                    Arg::with_name("starting_epoch")
+                        .long("starting-epoch")
+                        .takes_value(true)
+                        .value_name("NUM")
+                        .requires("with_rewards")
+                        .help("Start displaying from epoch NUM"),
+                )
+                .arg(
                     Arg::with_name("num_rewards_epochs")
                         .long("num-rewards-epochs")
                         .takes_value(true)
                         .value_name("NUM")
-                        .validator(|s| is_within_range(s, 1..=10))
+                        .validator(|s| is_within_range(s, 1..=50))
                         .default_value_if("with_rewards", None, "1")
                         .requires("with_rewards")
-                        .help("Display rewards for NUM recent epochs, max 10 [default: latest epoch only]"),
+                        .help(
+                            "Display rewards for NUM recent epochs, max 10 \
+                            [default: latest epoch only]",
+                        ),
                 ),
         )
         .subcommand(
             SubCommand::with_name("withdraw-from-vote-account")
                 .about("Withdraw lamports from a vote account into a specified account")
-                .arg(
-                    pubkey!(Arg::with_name("vote_account_pubkey")
+                .arg(pubkey!(
+                    Arg::with_name("vote_account_pubkey")
                         .index(1)
                         .value_name("VOTE_ACCOUNT_ADDRESS")
                         .required(true),
-                        "Vote account from which to withdraw. "),
-                )
-                .arg(
-                    pubkey!(Arg::with_name("destination_account_pubkey")
+                    "Vote account from which to withdraw."
+                ))
+                .arg(pubkey!(
+                    Arg::with_name("destination_account_pubkey")
                         .index(2)
                         .value_name("RECIPIENT_ADDRESS")
                         .required(true),
-                        "The recipient of withdrawn SOL. "),
-                )
+                    "The recipient of withdrawn SOL."
+                ))
                 .arg(
                     Arg::with_name("amount")
                         .index(3)
@@ -368,7 +400,10 @@ impl VoteSubCommands for App<'_, '_> {
                         .takes_value(true)
                         .required(true)
                         .validator(is_amount_or_all)
-                        .help("The amount to withdraw, in SOL; accepts keyword ALL, which for this command means account balance minus rent-exempt minimum"),
+                        .help(
+                            "The amount to withdraw, in SOL; accepts keyword ALL, which for this \
+                             command means account balance minus rent-exempt minimum",
+                        ),
                 )
                 .arg(
                     Arg::with_name("authorized_withdrawer")
@@ -382,26 +417,25 @@ impl VoteSubCommands for App<'_, '_> {
                 .nonce_args(false)
                 .arg(fee_payer_arg())
                 .arg(memo_arg())
-                .arg(compute_unit_price_arg()
-            )
+                .arg(compute_unit_price_arg()),
         )
         .subcommand(
             SubCommand::with_name("close-vote-account")
                 .about("Close a vote account and withdraw all funds remaining")
-                .arg(
-                    pubkey!(Arg::with_name("vote_account_pubkey")
+                .arg(pubkey!(
+                    Arg::with_name("vote_account_pubkey")
                         .index(1)
                         .value_name("VOTE_ACCOUNT_ADDRESS")
                         .required(true),
-                        "Vote account to be closed. "),
-                )
-                .arg(
-                    pubkey!(Arg::with_name("destination_account_pubkey")
+                    "Vote account to be closed."
+                ))
+                .arg(pubkey!(
+                    Arg::with_name("destination_account_pubkey")
                         .index(2)
                         .value_name("RECIPIENT_ADDRESS")
                         .required(true),
-                        "The recipient of all withdrawn SOL. "),
-                )
+                    "The recipient of all withdrawn SOL."
+                ))
                 .arg(
                     Arg::with_name("authorized_withdrawer")
                         .long("authorized-withdrawer")
@@ -412,8 +446,7 @@ impl VoteSubCommands for App<'_, '_> {
                 )
                 .arg(fee_payer_arg())
                 .arg(memo_arg())
-                .arg(compute_unit_price_arg()
-            )
+                .arg(compute_unit_price_arg()),
         )
     }
 }
@@ -421,7 +454,7 @@ impl VoteSubCommands for App<'_, '_> {
 pub fn parse_create_vote_account(
     matches: &ArgMatches<'_>,
     default_signer: &DefaultSigner,
-    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let (vote_account, vote_account_pubkey) = signer_of(matches, "vote_account", wallet_manager)?;
     let seed = matches.value_of("seed").map(|s| s.to_string());
@@ -445,15 +478,15 @@ pub fn parse_create_vote_account(
     if !allow_unsafe {
         if authorized_withdrawer == vote_account_pubkey.unwrap() {
             return Err(CliError::BadParameter(
-                "Authorized withdrawer pubkey is identical to vote \
-                                               account pubkey, an unsafe configuration"
+                "Authorized withdrawer pubkey is identical to vote account pubkey, an unsafe \
+                 configuration"
                     .to_owned(),
             ));
         }
         if authorized_withdrawer == identity_pubkey.unwrap() {
             return Err(CliError::BadParameter(
-                "Authorized withdrawer pubkey is identical to identity \
-                                               account pubkey, an unsafe configuration"
+                "Authorized withdrawer pubkey is identical to identity account pubkey, an unsafe \
+                 configuration"
                     .to_owned(),
             ));
         }
@@ -490,7 +523,7 @@ pub fn parse_create_vote_account(
 pub fn parse_vote_authorize(
     matches: &ArgMatches<'_>,
     default_signer: &DefaultSigner,
-    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
     vote_authorize: VoteAuthorize,
     checked: bool,
 ) -> Result<CliCommandInfo, CliError> {
@@ -551,7 +584,7 @@ pub fn parse_vote_authorize(
 pub fn parse_vote_update_validator(
     matches: &ArgMatches<'_>,
     default_signer: &DefaultSigner,
-    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let vote_account_pubkey =
         pubkey_of_signer(matches, "vote_account_pubkey", wallet_manager)?.unwrap();
@@ -598,7 +631,7 @@ pub fn parse_vote_update_validator(
 pub fn parse_vote_update_commission(
     matches: &ArgMatches<'_>,
     default_signer: &DefaultSigner,
-    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let vote_account_pubkey =
         pubkey_of_signer(matches, "vote_account_pubkey", wallet_manager)?.unwrap();
@@ -643,30 +676,33 @@ pub fn parse_vote_update_commission(
 
 pub fn parse_vote_get_account_command(
     matches: &ArgMatches<'_>,
-    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let vote_account_pubkey =
         pubkey_of_signer(matches, "vote_account_pubkey", wallet_manager)?.unwrap();
     let use_lamports_unit = matches.is_present("lamports");
+    let use_csv = matches.is_present("csv");
     let with_rewards = if matches.is_present("with_rewards") {
         Some(value_of(matches, "num_rewards_epochs").unwrap())
     } else {
         None
     };
-    Ok(CliCommandInfo {
-        command: CliCommand::ShowVoteAccount {
+    let starting_epoch = value_of(matches, "starting_epoch");
+    Ok(CliCommandInfo::without_signers(
+        CliCommand::ShowVoteAccount {
             pubkey: vote_account_pubkey,
             use_lamports_unit,
+            use_csv,
             with_rewards,
+            starting_epoch,
         },
-        signers: vec![],
-    })
+    ))
 }
 
 pub fn parse_withdraw_from_vote_account(
     matches: &ArgMatches<'_>,
     default_signer: &DefaultSigner,
-    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let vote_account_pubkey =
         pubkey_of_signer(matches, "vote_account_pubkey", wallet_manager)?.unwrap();
@@ -722,7 +758,7 @@ pub fn parse_withdraw_from_vote_account(
 pub fn parse_close_vote_account(
     matches: &ArgMatches<'_>,
     default_signer: &DefaultSigner,
-    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let vote_account_pubkey =
         pubkey_of_signer(matches, "vote_account_pubkey", wallet_manager)?.unwrap();
@@ -771,7 +807,7 @@ pub fn process_create_vote_account(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let vote_account = config.signers[vote_account];
     let vote_account_pubkey = vote_account.pubkey();
@@ -799,7 +835,12 @@ pub fn process_create_vote_account(
 
     let fee_payer = config.signers[fee_payer];
     let nonce_authority = config.signers[nonce_authority];
+    let space = VoteStateVersions::vote_state_size_of(true) as u64;
 
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let build_message = |lamports| {
         let vote_init = VoteInit {
             node_pubkey: identity_pubkey,
@@ -807,28 +848,30 @@ pub fn process_create_vote_account(
             authorized_withdrawer,
             commission,
         };
-
-        let ixs = if let Some(seed) = seed {
-            vote_instruction::create_account_with_seed(
-                &config.signers[0].pubkey(), // from
-                &vote_account_address,       // to
-                &vote_account_pubkey,        // base
-                seed,                        // seed
-                &vote_init,
-                lamports,
-            )
-            .with_memo(memo)
-            .with_compute_unit_price(compute_unit_price)
-        } else {
-            vote_instruction::create_account(
-                &config.signers[0].pubkey(),
-                &vote_account_pubkey,
-                &vote_init,
-                lamports,
-            )
-            .with_memo(memo)
-            .with_compute_unit_price(compute_unit_price)
+        let mut create_vote_account_config = CreateVoteAccountConfig {
+            space,
+            ..CreateVoteAccountConfig::default()
         };
+        let to = if let Some(seed) = seed {
+            create_vote_account_config.with_seed = Some((&vote_account_pubkey, seed));
+            &vote_account_address
+        } else {
+            &vote_account_pubkey
+        };
+
+        let ixs = vote_instruction::create_account_with_config(
+            &config.signers[0].pubkey(),
+            to,
+            &vote_init,
+            lamports,
+            create_vote_account_config,
+        )
+        .with_memo(memo)
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
+
         if let Some(nonce_account) = &nonce_account {
             Message::new_with_nonce(
                 ixs,
@@ -850,6 +893,7 @@ pub fn process_create_vote_account(
         &recent_blockhash,
         &config.signers[0].pubkey(),
         &fee_payer.pubkey(),
+        compute_unit_limit,
         build_message,
         config.commitment,
     )?;
@@ -892,7 +936,11 @@ pub fn process_create_vote_account(
         )
     } else {
         tx.try_sign(&config.signers, recent_blockhash)?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            config.commitment,
+            config.send_transaction_config,
+        );
         log_instruction_custom_error::<SystemError>(result, config)
     }
 }
@@ -913,7 +961,7 @@ pub fn process_vote_authorize(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let authorized = config.signers[authorized];
     let new_authorized_signer = new_authorized.map(|index| config.signers[index]);
@@ -942,8 +990,10 @@ pub fn process_vote_authorize(
                 if let Some(signer) = new_authorized_signer {
                     if signer.is_interactive() {
                         return Err(CliError::BadParameter(format!(
-                            "invalid new authorized vote signer {new_authorized_pubkey:?}. Interactive vote signers not supported"
-                        )).into());
+                            "invalid new authorized vote signer {new_authorized_pubkey:?}. \
+                             Interactive vote signers not supported"
+                        ))
+                        .into());
                     }
                 }
             }
@@ -974,16 +1024,24 @@ pub fn process_vote_authorize(
             vote_authorize,        // vote or withdraw
         )
     };
+
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let ixs = vec![vote_ix]
         .with_memo(memo)
-        .with_compute_unit_price(compute_unit_price);
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
 
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
 
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
-    let message = if let Some(nonce_account) = &nonce_account {
+    let mut message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
             Some(&fee_payer.pubkey()),
@@ -993,6 +1051,7 @@ pub fn process_vote_authorize(
     } else {
         Message::new(&ixs, Some(&fee_payer.pubkey()))
     };
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
 
     if sign_only {
@@ -1020,7 +1079,11 @@ pub fn process_vote_authorize(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            config.commitment,
+            config.send_transaction_config,
+        );
         log_instruction_custom_error::<VoteError>(result, config)
     }
 }
@@ -1039,7 +1102,7 @@ pub fn process_vote_update_validator(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let authorized_withdrawer = config.signers[withdraw_authority];
     let new_identity_account = config.signers[new_identity_account];
@@ -1049,17 +1112,24 @@ pub fn process_vote_update_validator(
         (&new_identity_pubkey, "new_identity_account".to_string()),
     )?;
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let ixs = vec![vote_instruction::update_validator_identity(
         vote_account_pubkey,
         &authorized_withdrawer.pubkey(),
         &new_identity_pubkey,
     )]
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
-    let message = if let Some(nonce_account) = &nonce_account {
+    let mut message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
             Some(&fee_payer.pubkey()),
@@ -1069,6 +1139,7 @@ pub fn process_vote_update_validator(
     } else {
         Message::new(&ixs, Some(&fee_payer.pubkey()))
     };
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
 
     if sign_only {
@@ -1096,7 +1167,11 @@ pub fn process_vote_update_validator(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            config.commitment,
+            config.send_transaction_config,
+        );
         log_instruction_custom_error::<VoteError>(result, config)
     }
 }
@@ -1115,21 +1190,28 @@ pub fn process_vote_update_commission(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let authorized_withdrawer = config.signers[withdraw_authority];
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let ixs = vec![vote_instruction::update_commission(
         vote_account_pubkey,
         &authorized_withdrawer.pubkey(),
         commission,
     )]
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
-    let message = if let Some(nonce_account) = &nonce_account {
+    let mut message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
             Some(&fee_payer.pubkey()),
@@ -1139,6 +1221,7 @@ pub fn process_vote_update_commission(
     } else {
         Message::new(&ixs, Some(&fee_payer.pubkey()))
     };
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
     if sign_only {
         tx.try_partial_sign(&config.signers, recent_blockhash)?;
@@ -1165,7 +1248,11 @@ pub fn process_vote_update_commission(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            config.commitment,
+            config.send_transaction_config,
+        );
         log_instruction_custom_error::<VoteError>(result, config)
     }
 }
@@ -1202,35 +1289,52 @@ pub fn process_show_vote_account(
     config: &CliConfig,
     vote_account_address: &Pubkey,
     use_lamports_unit: bool,
+    use_csv: bool,
     with_rewards: Option<usize>,
+    starting_epoch: Option<u64>,
 ) -> ProcessResult {
     let (vote_account, vote_state) =
         get_vote_account(rpc_client, vote_account_address, config.commitment)?;
 
     let epoch_schedule = rpc_client.get_epoch_schedule()?;
+    let tvc_activation_slot =
+        rpc_client.get_feature_activation_slot(&solana_feature_set::timely_vote_credits::id())?;
+    let tvc_activation_epoch = tvc_activation_slot.map(|s| epoch_schedule.get_epoch(s));
 
-    let mut votes: Vec<CliLockout> = vec![];
+    let mut votes: Vec<CliLandedVote> = vec![];
     let mut epoch_voting_history: Vec<CliEpochVotingHistory> = vec![];
     if !vote_state.votes.is_empty() {
         for vote in &vote_state.votes {
             votes.push(vote.into());
         }
         for (epoch, credits, prev_credits) in vote_state.epoch_credits().iter().copied() {
-            let credits_earned = credits - prev_credits;
+            let credits_earned = credits.saturating_sub(prev_credits);
             let slots_in_epoch = epoch_schedule.get_slots_in_epoch(epoch);
+            let is_tvc_active = tvc_activation_epoch.map(|e| epoch >= e).unwrap_or_default();
+            let max_credits_per_slot = if is_tvc_active {
+                VOTE_CREDITS_MAXIMUM_PER_SLOT
+            } else {
+                1
+            };
             epoch_voting_history.push(CliEpochVotingHistory {
                 epoch,
                 slots_in_epoch,
                 credits_earned,
                 credits,
                 prev_credits,
+                max_credits_per_slot,
             });
         }
     }
 
     let epoch_rewards =
         with_rewards.and_then(|num_epochs| {
-            match crate::stake::fetch_epoch_rewards(rpc_client, vote_account_address, num_epochs) {
+            match crate::stake::fetch_epoch_rewards(
+                rpc_client,
+                vote_account_address,
+                num_epochs,
+                starting_epoch,
+            ) {
                 Ok(rewards) => Some(rewards),
                 Err(error) => {
                     eprintln!("Failed to fetch epoch rewards: {error:?}");
@@ -1251,6 +1355,7 @@ pub fn process_show_vote_account(
         votes,
         epoch_voting_history,
         use_lamports_unit,
+        use_csv,
         epoch_rewards,
     };
 
@@ -1272,7 +1377,7 @@ pub fn process_withdraw_from_vote_account(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let withdraw_authority = config.signers[withdraw_authority];
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
@@ -1280,6 +1385,10 @@ pub fn process_withdraw_from_vote_account(
     let fee_payer = config.signers[fee_payer];
     let nonce_authority = config.signers[nonce_authority];
 
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let build_message = |lamports| {
         let ixs = vec![withdraw(
             vote_account_pubkey,
@@ -1288,7 +1397,10 @@ pub fn process_withdraw_from_vote_account(
             destination_account_pubkey,
         )]
         .with_memo(memo)
-        .with_compute_unit_price(compute_unit_price);
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
 
         if let Some(nonce_account) = &nonce_account {
             Message::new_with_nonce(
@@ -1309,6 +1421,7 @@ pub fn process_withdraw_from_vote_account(
         &recent_blockhash,
         vote_account_pubkey,
         &fee_payer.pubkey(),
+        compute_unit_limit,
         build_message,
         config.commitment,
     )?;
@@ -1321,7 +1434,9 @@ pub fn process_withdraw_from_vote_account(
             let balance_remaining = current_balance.saturating_sub(withdraw_amount);
             if balance_remaining < minimum_balance && balance_remaining != 0 {
                 return Err(CliError::BadParameter(format!(
-                    "Withdraw amount too large. The vote account balance must be at least {} SOL to remain rent exempt", lamports_to_sol(minimum_balance)
+                    "Withdraw amount too large. The vote account balance must be at least {} SOL \
+                     to remain rent exempt",
+                    lamports_to_sol(minimum_balance)
                 ))
                 .into());
             }
@@ -1355,7 +1470,11 @@ pub fn process_withdraw_from_vote_account(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            config.commitment,
+            config.send_transaction_config,
+        );
         log_instruction_custom_error::<VoteError>(result, config)
     }
 }
@@ -1368,7 +1487,7 @@ pub fn process_close_vote_account(
     destination_account_pubkey: &Pubkey,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let vote_account_status =
         rpc_client.get_vote_accounts_with_config(RpcGetVoteAccountsConfig {
@@ -1379,7 +1498,7 @@ pub fn process_close_vote_account(
     if let Some(vote_account) = vote_account_status
         .current
         .into_iter()
-        .chain(vote_account_status.delinquent.into_iter())
+        .chain(vote_account_status.delinquent)
         .next()
     {
         if vote_account.activated_stake != 0 {
@@ -1396,6 +1515,7 @@ pub fn process_close_vote_account(
 
     let current_balance = rpc_client.get_balance(vote_account_pubkey)?;
 
+    let compute_unit_limit = ComputeUnitLimit::Simulated;
     let ixs = vec![withdraw(
         vote_account_pubkey,
         &withdraw_authority.pubkey(),
@@ -1403,9 +1523,13 @@ pub fn process_close_vote_account(
         destination_account_pubkey,
     )]
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
 
-    let message = Message::new(&ixs, Some(&fee_payer.pubkey()));
+    let mut message = Message::new(&ixs, Some(&fee_payer.pubkey()));
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
     tx.try_sign(&config.signers, latest_blockhash)?;
     check_account_for_fee_with_commitment(
@@ -1414,7 +1538,11 @@ pub fn process_close_vote_account(
         &tx.message,
         config.commitment,
     )?;
-    let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+        &tx,
+        config.commitment,
+        config.send_transaction_config,
+    );
     log_instruction_custom_error::<VoteError>(result, config)
 }
 
@@ -1423,12 +1551,11 @@ mod tests {
     use {
         super::*,
         crate::{clap_app::get_clap_app, cli::parse_command},
+        solana_hash::Hash,
+        solana_keypair::{read_keypair_file, write_keypair, Keypair},
+        solana_presigner::Presigner,
         solana_rpc_client_nonce_utils::blockhash_query,
-        solana_sdk::{
-            hash::Hash,
-            signature::{read_keypair_file, write_keypair, Keypair, Signer},
-            signer::presigner::Presigner,
-        },
+        solana_signer::Signer,
         tempfile::NamedTempFile,
     };
 
@@ -1484,7 +1611,7 @@ mod tests {
                     new_authorized: None,
                     compute_unit_price: None,
                 },
-                signers: vec![read_keypair_file(&default_keypair_file).unwrap().into()],
+                signers: vec![Box::new(read_keypair_file(&default_keypair_file).unwrap())],
             }
         );
 
@@ -1518,8 +1645,8 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
-                    read_keypair_file(&authorized_keypair_file).unwrap().into(),
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&authorized_keypair_file).unwrap()),
                 ],
             }
         );
@@ -1553,8 +1680,8 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
-                    read_keypair_file(&authorized_keypair_file).unwrap().into(),
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&authorized_keypair_file).unwrap()),
                 ],
             }
         );
@@ -1602,8 +1729,11 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    Presigner::new(&pubkey2, &sig2).into(),
-                    Presigner::new(&authorized_keypair.pubkey(), &authorized_sig).into(),
+                    Box::new(Presigner::new(&pubkey2, &sig2)),
+                    Box::new(Presigner::new(
+                        &authorized_keypair.pubkey(),
+                        &authorized_sig
+                    )),
                 ],
             }
         );
@@ -1639,8 +1769,8 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
-                    read_keypair_file(&voter_keypair_file).unwrap().into()
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&voter_keypair_file).unwrap())
                 ],
             }
         );
@@ -1671,9 +1801,9 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
-                    read_keypair_file(&authorized_keypair_file).unwrap().into(),
-                    read_keypair_file(&voter_keypair_file).unwrap().into(),
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&authorized_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&voter_keypair_file).unwrap()),
                 ],
             }
         );
@@ -1725,9 +1855,9 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
-                    read_keypair_file(&keypair_file).unwrap().into(),
-                    read_keypair_file(&identity_keypair_file).unwrap().into(),
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&identity_keypair_file).unwrap()),
                 ],
             }
         );
@@ -1759,9 +1889,9 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
-                    read_keypair_file(&keypair_file).unwrap().into(),
-                    read_keypair_file(&identity_keypair_file).unwrap().into(),
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&identity_keypair_file).unwrap()),
                 ],
             }
         );
@@ -1800,9 +1930,9 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
-                    read_keypair_file(&keypair_file).unwrap().into(),
-                    read_keypair_file(&identity_keypair_file).unwrap().into(),
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&identity_keypair_file).unwrap()),
                 ],
             }
         );
@@ -1853,16 +1983,16 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
-                    read_keypair_file(&keypair_file).unwrap().into(),
-                    Presigner::new(&identity_keypair.pubkey(), &identity_sig).into(),
-                    Presigner::new(&pubkey2, &sig2).into(),
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&keypair_file).unwrap()),
+                    Box::new(Presigner::new(&identity_keypair.pubkey(), &identity_sig)),
+                    Box::new(Presigner::new(&pubkey2, &sig2)),
                 ],
             }
         );
 
         // test init with an authed voter
-        let authed = solana_sdk::pubkey::new_rand();
+        let authed = solana_pubkey::new_rand();
         let (keypair_file, mut tmp_file) = make_tmp_file();
         let keypair = Keypair::new();
         write_keypair(&keypair, tmp_file.as_file_mut()).unwrap();
@@ -1896,9 +2026,9 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
                     Box::new(keypair),
-                    read_keypair_file(&identity_keypair_file).unwrap().into(),
+                    Box::new(read_keypair_file(&identity_keypair_file).unwrap()),
                 ],
             }
         );
@@ -1935,9 +2065,9 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
-                    read_keypair_file(&keypair_file).unwrap().into(),
-                    read_keypair_file(&identity_keypair_file).unwrap().into(),
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&identity_keypair_file).unwrap()),
                 ],
             }
         );
@@ -1966,9 +2096,9 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
                     Box::new(read_keypair_file(&keypair_file).unwrap()),
-                    read_keypair_file(&identity_keypair_file).unwrap().into(),
+                    Box::new(read_keypair_file(&identity_keypair_file).unwrap()),
                 ],
             }
         );
@@ -1997,7 +2127,7 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
                     Box::new(read_keypair_file(&keypair_file).unwrap()),
                 ],
             }
@@ -2028,7 +2158,7 @@ mod tests {
                     fee_payer: 0,
                     compute_unit_price: None,
                 },
-                signers: vec![read_keypair_file(&default_keypair_file).unwrap().into()],
+                signers: vec![Box::new(read_keypair_file(&default_keypair_file).unwrap())],
             }
         );
 
@@ -2057,7 +2187,7 @@ mod tests {
                     fee_payer: 0,
                     compute_unit_price: None,
                 },
-                signers: vec![read_keypair_file(&default_keypair_file).unwrap().into()],
+                signers: vec![Box::new(read_keypair_file(&default_keypair_file).unwrap())],
             }
         );
 
@@ -2092,8 +2222,8 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
-                    read_keypair_file(&withdraw_authority_file).unwrap().into()
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&withdraw_authority_file).unwrap())
                 ],
             }
         );
@@ -2130,7 +2260,9 @@ mod tests {
                     fee_payer: 0,
                     compute_unit_price: None,
                 },
-                signers: vec![read_keypair_file(&withdraw_authority_file).unwrap().into()],
+                signers: vec![Box::new(
+                    read_keypair_file(&withdraw_authority_file).unwrap()
+                )],
             }
         );
 
@@ -2171,7 +2303,10 @@ mod tests {
                     fee_payer: 0,
                     compute_unit_price: None,
                 },
-                signers: vec![Presigner::new(&withdraw_authority.pubkey(), &authorized_sig).into(),],
+                signers: vec![Box::new(Presigner::new(
+                    &withdraw_authority.pubkey(),
+                    &authorized_sig
+                )),],
             }
         );
 
@@ -2193,7 +2328,7 @@ mod tests {
                     fee_payer: 0,
                     compute_unit_price: None,
                 },
-                signers: vec![read_keypair_file(&default_keypair_file).unwrap().into()],
+                signers: vec![Box::new(read_keypair_file(&default_keypair_file).unwrap())],
             }
         );
 
@@ -2221,8 +2356,8 @@ mod tests {
                     compute_unit_price: None,
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
-                    read_keypair_file(&withdraw_authority_file).unwrap().into()
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&withdraw_authority_file).unwrap())
                 ],
             }
         );
@@ -2253,8 +2388,8 @@ mod tests {
                     compute_unit_price: Some(99),
                 },
                 signers: vec![
-                    read_keypair_file(&default_keypair_file).unwrap().into(),
-                    read_keypair_file(&withdraw_authority_file).unwrap().into()
+                    Box::new(read_keypair_file(&default_keypair_file).unwrap()),
+                    Box::new(read_keypair_file(&withdraw_authority_file).unwrap())
                 ],
             }
         );

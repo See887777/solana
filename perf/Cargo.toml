@@ -1,43 +1,81 @@
 [package]
 name = "solana-perf"
-version = "1.16.0"
 description = "Solana Performance APIs"
-authors = ["Solana Labs Maintainers <maintainers@solanalabs.com>"]
-repository = "https://github.com/solana-labs/solana"
-license = "Apache-2.0"
-homepage = "https://solana.com/"
 documentation = "https://docs.rs/solana-perf"
-edition = "2021"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
 
 [dependencies]
-ahash = "0.7.6"
-bincode = "1.3.3"
-bv = { version = "0.11.1", features = ["serde"] }
-curve25519-dalek = { version = "3" }
-dlopen = "0.1.8"
-dlopen_derive = "0.1.4"
-fnv = "1.0.7"
-lazy_static = "1.4.0"
-log = "0.4.17"
-rand = "0.7.0"
-rayon = "1.5.3"
-serde = "1.0.152"
-solana-metrics = { path = "../metrics", version = "=1.16.0" }
-solana-rayon-threadlimit = { path = "../rayon-threadlimit", version = "=1.16.0" }
-solana-sdk = { path = "../sdk", version = "=1.16.0" }
-solana-vote-program = { path = "../programs/vote", version = "=1.16.0" }
+ahash = { workspace = true }
+bincode = { workspace = true }
+bv = { workspace = true, features = ["serde"] }
+curve25519-dalek = { workspace = true }
+dlopen2 = { workspace = true }
+fnv = { workspace = true }
+lazy_static = { workspace = true }
+log = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+solana-clock = { workspace = true, optional = true }
+solana-frozen-abi = { workspace = true, optional = true, features = [
+    "frozen-abi",
+] }
+solana-frozen-abi-macro = { workspace = true, optional = true, features = [
+    "frozen-abi",
+] }
+solana-hash = { workspace = true }
+solana-keypair = { workspace = true, optional = true }
+solana-message = { workspace = true }
+solana-metrics = { workspace = true }
+solana-packet = { workspace = true, features = ["bincode"] }
+solana-pubkey = { workspace = true, default-features = false }
+solana-rayon-threadlimit = { workspace = true }
+solana-sdk-ids = { workspace = true }
+solana-short-vec = { workspace = true }
+solana-signature = { workspace = true, features = ["verify"] }
+solana-signer = { workspace = true, optional = true }
+solana-system-interface = { workspace = true, optional = true }
+solana-system-transaction = { workspace = true, optional = true }
+solana-time-utils = { workspace = true }
+solana-transaction = { workspace = true, optional = true }
+solana-vote-program = { workspace = true, optional = true }
 
 [target."cfg(target_os = \"linux\")".dependencies]
-caps = "0.5.4"
-libc = "0.2.131"
-nix = "0.25.0"
+caps = { workspace = true }
+libc = { workspace = true }
+nix = { workspace = true, features = ["user"] }
 
 [lib]
 name = "solana_perf"
 
 [dev-dependencies]
-matches = "0.1.9"
-solana-logger = { path = "../logger", version = "=1.16.0" }
+assert_matches = { workspace = true }
+rand_chacha = { workspace = true }
+solana-logger = { workspace = true }
+solana-perf = { path = ".", features = ["dev-context-only-utils"] }
+test-case = { workspace = true }
+
+[features]
+dev-context-only-utils = [
+    "dep:solana-clock",
+    "dep:solana-keypair",
+    "dep:solana-signer",
+    "dep:solana-system-interface",
+    "dep:solana-system-transaction",
+    "dep:solana-transaction",
+    "dep:solana-vote-program",
+]
+frozen-abi = [
+    "dep:solana-frozen-abi",
+    "dep:solana-frozen-abi-macro",
+    "solana-short-vec/frozen-abi",
+    "solana-vote-program/frozen-abi",
+]
 
 [[bench]]
 name = "sigverify"
@@ -47,3 +85,7 @@ name = "discard"
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(build_target_feature_avx)', 'cfg(build_target_feature_avx2)']

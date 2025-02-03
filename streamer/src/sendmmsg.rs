@@ -1,16 +1,17 @@
 //! The `sendmmsg` module provides sendmmsg() API implementation
 
 #[cfg(target_os = "linux")]
-#[allow(deprecated)]
-use nix::sys::socket::InetAddr;
-#[cfg(target_os = "linux")]
 use {
     itertools::izip,
-    libc::{iovec, mmsghdr, sockaddr_in, sockaddr_in6, sockaddr_storage},
-    std::os::unix::io::AsRawFd,
+    libc::{iovec, mmsghdr, msghdr, sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t},
+    std::{
+        mem::{self, MaybeUninit},
+        os::unix::io::AsRawFd,
+        ptr,
+    },
 };
 use {
-    solana_sdk::transport::TransportError,
+    solana_transaction_error::TransportError,
     std::{
         borrow::Borrow,
         io,
@@ -61,36 +62,86 @@ where
 fn mmsghdr_for_packet(
     packet: &[u8],
     dest: &SocketAddr,
-    iov: &mut iovec,
-    addr: &mut sockaddr_storage,
-    hdr: &mut mmsghdr,
+    iov: &mut MaybeUninit<iovec>,
+    addr: &mut MaybeUninit<sockaddr_storage>,
+    hdr: &mut MaybeUninit<mmsghdr>,
 ) {
-    const SIZE_OF_SOCKADDR_IN: usize = std::mem::size_of::<sockaddr_in>();
-    const SIZE_OF_SOCKADDR_IN6: usize = std::mem::size_of::<sockaddr_in6>();
+    const SIZE_OF_SOCKADDR_IN: usize = mem::size_of::<sockaddr_in>();
+    const SIZE_OF_SOCKADDR_IN6: usize = mem::size_of::<sockaddr_in6>();
+    const SIZE_OF_SOCKADDR_STORAGE: usize = mem::size_of::<sockaddr_storage>();
+    const SOCKADDR_IN_PADDING: usize = SIZE_OF_SOCKADDR_STORAGE - SIZE_OF_SOCKADDR_IN;
+    const SOCKADDR_IN6_PADDING: usize = SIZE_OF_SOCKADDR_STORAGE - SIZE_OF_SOCKADDR_IN6;
 
-    *iov = iovec {
+    iov.write(iovec {
         iov_base: packet.as_ptr() as *mut libc::c_void,
         iov_len: packet.len(),
-    };
-    hdr.msg_hdr.msg_iov = iov;
-    hdr.msg_hdr.msg_iovlen = 1;
-    hdr.msg_hdr.msg_name = addr as *mut _ as *mut _;
+    });
 
-    #[allow(deprecated)]
-    match InetAddr::from_std(dest) {
-        InetAddr::V4(dest) => {
+    let msg_namelen = match dest {
+        SocketAddr::V4(socket_addr_v4) => {
+            let ptr: *mut sockaddr_in = addr.as_mut_ptr() as *mut _;
             unsafe {
-                std::ptr::write(addr as *mut _ as *mut _, dest);
+                ptr::write(
+                    ptr,
+                    *nix::sys::socket::SockaddrIn::from(*socket_addr_v4).as_ref(),
+                );
+                // Zero the remaining bytes after sockaddr_in
+                ptr::write_bytes(
+                    (ptr as *mut u8).add(SIZE_OF_SOCKADDR_IN),
+                    0,
+                    SOCKADDR_IN_PADDING,
+                );
             }
-            hdr.msg_hdr.msg_namelen = SIZE_OF_SOCKADDR_IN as u32;
+            SIZE_OF_SOCKADDR_IN as socklen_t
         }
-        InetAddr::V6(dest) => {
+        SocketAddr::V6(socket_addr_v6) => {
+            let ptr: *mut sockaddr_in6 = addr.as_mut_ptr() as *mut _;
             unsafe {
-                std::ptr::write(addr as *mut _ as *mut _, dest);
+                ptr::write(
+                    ptr,
+                    *nix::sys::socket::SockaddrIn6::from(*socket_addr_v6).as_ref(),
+                );
+                // Zero the remaining bytes after sockaddr_in6
+                ptr::write_bytes(
+                    (ptr as *mut u8).add(SIZE_OF_SOCKADDR_IN6),
+                    0,
+                    SOCKADDR_IN6_PADDING,
+                );
             }
-            hdr.msg_hdr.msg_namelen = SIZE_OF_SOCKADDR_IN6 as u32;
+            SIZE_OF_SOCKADDR_IN6 as socklen_t
         }
     };
+
+    #[cfg(not(target_env = "musl"))]
+    let msg_hdr = msghdr {
+        msg_name: addr as *mut _ as *mut _,
+        msg_namelen,
+        msg_iov: iov.as_mut_ptr(),
+        msg_iovlen: 1,
+        msg_control: ptr::null::<libc::c_void>() as *mut _,
+        msg_controllen: 0,
+        msg_flags: 0,
+    };
+
+    #[cfg(target_env = "musl")]
+    let msg_hdr = {
+        // Cannot construct msghdr directly on musl
+        // See https://github.com/rust-lang/libc/issues/2344 for more info
+        let mut msg_hdr: msghdr = unsafe { std::mem::zeroed() };
+        msg_hdr.msg_name = addr as *mut _ as *mut _;
+        msg_hdr.msg_namelen = msg_namelen;
+        msg_hdr.msg_iov = iov.as_mut_ptr();
+        msg_hdr.msg_iovlen = 1;
+        msg_hdr.msg_control = ptr::null::<libc::c_void>() as *mut _;
+        msg_hdr.msg_controllen = 0;
+        msg_hdr.msg_flags = 0;
+        msg_hdr
+    };
+
+    hdr.write(mmsghdr {
+        msg_len: 0,
+        msg_hdr,
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -127,21 +178,55 @@ fn sendmmsg_retry(sock: &UdpSocket, hdrs: &mut [mmsghdr]) -> Result<(), SendPkts
 }
 
 #[cfg(target_os = "linux")]
+const MAX_IOV: usize = libc::UIO_MAXIOV as usize;
+
+#[cfg(target_os = "linux")]
+pub fn batch_send_max_iov<S, T>(sock: &UdpSocket, packets: &[(T, S)]) -> Result<(), SendPktsError>
+where
+    S: Borrow<SocketAddr>,
+    T: AsRef<[u8]>,
+{
+    assert!(packets.len() <= MAX_IOV);
+
+    let mut iovs = [MaybeUninit::uninit(); MAX_IOV];
+    let mut addrs = [MaybeUninit::uninit(); MAX_IOV];
+    let mut hdrs = [MaybeUninit::uninit(); MAX_IOV];
+
+    // izip! will iterate packets.len() times, leaving hdrs, iovs, and addrs initialized only up to packets.len()
+    for ((pkt, dest), hdr, iov, addr) in izip!(packets, &mut hdrs, &mut iovs, &mut addrs) {
+        mmsghdr_for_packet(pkt.as_ref(), dest.borrow(), iov, addr, hdr);
+    }
+
+    // SAFETY: The first `packets.len()` elements of `hdrs`, `iovs`, and `addrs` are
+    // guaranteed to be initialized by `mmsghdr_for_packet` before this loop.
+    let hdrs_slice =
+        unsafe { std::slice::from_raw_parts_mut(hdrs.as_mut_ptr() as *mut mmsghdr, packets.len()) };
+
+    let result = sendmmsg_retry(sock, hdrs_slice);
+
+    // SAFETY: The first `packets.len()` elements of `hdrs`, `iovs`, and `addrs` are
+    // guaranteed to be initialized by `mmsghdr_for_packet` before this loop.
+    for (hdr, iov, addr) in izip!(&mut hdrs, &mut iovs, &mut addrs).take(packets.len()) {
+        unsafe {
+            hdr.assume_init_drop();
+            iov.assume_init_drop();
+            addr.assume_init_drop();
+        }
+    }
+
+    result
+}
+
+#[cfg(target_os = "linux")]
 pub fn batch_send<S, T>(sock: &UdpSocket, packets: &[(T, S)]) -> Result<(), SendPktsError>
 where
     S: Borrow<SocketAddr>,
     T: AsRef<[u8]>,
 {
-    let size = packets.len();
-    #[allow(clippy::uninit_assumed_init)]
-    let iovec = std::mem::MaybeUninit::<iovec>::uninit();
-    let mut iovs = vec![unsafe { iovec.assume_init() }; size];
-    let mut addrs = vec![unsafe { std::mem::zeroed() }; size];
-    let mut hdrs = vec![unsafe { std::mem::zeroed() }; size];
-    for ((pkt, dest), hdr, iov, addr) in izip!(packets, &mut hdrs, &mut iovs, &mut addrs) {
-        mmsghdr_for_packet(pkt.as_ref(), dest.borrow(), iov, addr, hdr);
+    for chunk in packets.chunks(MAX_IOV) {
+        batch_send_max_iov(sock, chunk)?;
     }
-    sendmmsg_retry(sock, &mut hdrs)
+    Ok(())
 }
 
 pub fn multi_target_send<S, T>(
@@ -166,18 +251,20 @@ mod tests {
             recvmmsg::recv_mmsg,
             sendmmsg::{batch_send, multi_target_send, SendPktsError},
         },
-        solana_sdk::packet::PACKET_DATA_SIZE,
+        assert_matches::assert_matches,
+        solana_net_utils::{bind_to_localhost, bind_to_unspecified},
+        solana_packet::PACKET_DATA_SIZE,
         std::{
             io::ErrorKind,
-            net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+            net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         },
     };
 
     #[test]
     pub fn test_send_mmsg_one_dest() {
-        let reader = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let reader = bind_to_localhost().expect("bind");
         let addr = reader.local_addr().unwrap();
-        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let sender = bind_to_localhost().expect("bind");
 
         let packets: Vec<_> = (0..32).map(|_| vec![0u8; PACKET_DATA_SIZE]).collect();
         let packet_refs: Vec<_> = packets.iter().map(|p| (&p[..], &addr)).collect();
@@ -192,13 +279,13 @@ mod tests {
 
     #[test]
     pub fn test_send_mmsg_multi_dest() {
-        let reader = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let reader = bind_to_localhost().expect("bind");
         let addr = reader.local_addr().unwrap();
 
-        let reader2 = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let reader2 = bind_to_localhost().expect("bind");
         let addr2 = reader2.local_addr().unwrap();
 
-        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let sender = bind_to_localhost().expect("bind");
 
         let packets: Vec<_> = (0..32).map(|_| vec![0u8; PACKET_DATA_SIZE]).collect();
         let packet_refs: Vec<_> = packets
@@ -227,19 +314,19 @@ mod tests {
 
     #[test]
     pub fn test_multicast_msg() {
-        let reader = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let reader = bind_to_localhost().expect("bind");
         let addr = reader.local_addr().unwrap();
 
-        let reader2 = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let reader2 = bind_to_localhost().expect("bind");
         let addr2 = reader2.local_addr().unwrap();
 
-        let reader3 = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let reader3 = bind_to_localhost().expect("bind");
         let addr3 = reader3.local_addr().unwrap();
 
-        let reader4 = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let reader4 = bind_to_localhost().expect("bind");
         let addr4 = reader4.local_addr().unwrap();
 
-        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let sender = bind_to_localhost().expect("bind");
 
         let packet = Packet::default();
 
@@ -280,15 +367,11 @@ mod tests {
         ];
         let dest_refs: Vec<_> = vec![&ip4, &ip6, &ip4];
 
-        let sender = UdpSocket::bind("0.0.0.0:0").expect("bind");
-        if let Err(SendPktsError::IoError(_, num_failed)) = batch_send(&sender, &packet_refs[..]) {
-            assert_eq!(num_failed, 1);
-        }
-        if let Err(SendPktsError::IoError(_, num_failed)) =
-            multi_target_send(&sender, &packets[0], &dest_refs)
-        {
-            assert_eq!(num_failed, 1);
-        }
+        let sender = bind_to_unspecified().expect("bind");
+        let res = batch_send(&sender, &packet_refs[..]);
+        assert_matches!(res, Err(SendPktsError::IoError(_, /*num_failed*/ 1)));
+        let res = multi_target_send(&sender, &packets[0], &dest_refs);
+        assert_matches!(res, Err(SendPktsError::IoError(_, /*num_failed*/ 1)));
     }
 
     #[test]
@@ -296,7 +379,7 @@ mod tests {
         let packets: Vec<_> = (0..5).map(|_| vec![0u8; PACKET_DATA_SIZE]).collect();
         let ipv4local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let ipv4broadcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 8080);
-        let sender = UdpSocket::bind("0.0.0.0:0").expect("bind");
+        let sender = bind_to_unspecified().expect("bind");
 
         // test intermediate failures for batch_send
         let packet_refs: Vec<_> = vec![
@@ -306,11 +389,12 @@ mod tests {
             (&packets[3][..], &ipv4broadcast),
             (&packets[4][..], &ipv4local),
         ];
-        if let Err(SendPktsError::IoError(ioerror, num_failed)) =
-            batch_send(&sender, &packet_refs[..])
-        {
-            assert!(matches!(ioerror.kind(), ErrorKind::PermissionDenied));
-            assert_eq!(num_failed, 2);
+        match batch_send(&sender, &packet_refs[..]) {
+            Ok(()) => panic!(),
+            Err(SendPktsError::IoError(ioerror, num_failed)) => {
+                assert_matches!(ioerror.kind(), ErrorKind::PermissionDenied);
+                assert_eq!(num_failed, 2);
+            }
         }
 
         // test leading and trailing failures for batch_send
@@ -321,11 +405,12 @@ mod tests {
             (&packets[3][..], &ipv4local),
             (&packets[4][..], &ipv4broadcast),
         ];
-        if let Err(SendPktsError::IoError(ioerror, num_failed)) =
-            batch_send(&sender, &packet_refs[..])
-        {
-            assert!(matches!(ioerror.kind(), ErrorKind::PermissionDenied));
-            assert_eq!(num_failed, 3);
+        match batch_send(&sender, &packet_refs[..]) {
+            Ok(()) => panic!(),
+            Err(SendPktsError::IoError(ioerror, num_failed)) => {
+                assert_matches!(ioerror.kind(), ErrorKind::PermissionDenied);
+                assert_eq!(num_failed, 3);
+            }
         }
 
         // test consecutive intermediate failures for batch_send
@@ -336,11 +421,12 @@ mod tests {
             (&packets[3][..], &ipv4broadcast),
             (&packets[4][..], &ipv4local),
         ];
-        if let Err(SendPktsError::IoError(ioerror, num_failed)) =
-            batch_send(&sender, &packet_refs[..])
-        {
-            assert!(matches!(ioerror.kind(), ErrorKind::PermissionDenied));
-            assert_eq!(num_failed, 2);
+        match batch_send(&sender, &packet_refs[..]) {
+            Ok(()) => panic!(),
+            Err(SendPktsError::IoError(ioerror, num_failed)) => {
+                assert_matches!(ioerror.kind(), ErrorKind::PermissionDenied);
+                assert_eq!(num_failed, 2);
+            }
         }
 
         // test intermediate failures for multi_target_send
@@ -351,11 +437,12 @@ mod tests {
             &ipv4broadcast,
             &ipv4local,
         ];
-        if let Err(SendPktsError::IoError(ioerror, num_failed)) =
-            multi_target_send(&sender, &packets[0], &dest_refs)
-        {
-            assert!(matches!(ioerror.kind(), ErrorKind::PermissionDenied));
-            assert_eq!(num_failed, 2);
+        match multi_target_send(&sender, &packets[0], &dest_refs) {
+            Ok(()) => panic!(),
+            Err(SendPktsError::IoError(ioerror, num_failed)) => {
+                assert_matches!(ioerror.kind(), ErrorKind::PermissionDenied);
+                assert_eq!(num_failed, 2);
+            }
         }
 
         // test leading and trailing failures for multi_target_send
@@ -366,11 +453,12 @@ mod tests {
             &ipv4local,
             &ipv4broadcast,
         ];
-        if let Err(SendPktsError::IoError(ioerror, num_failed)) =
-            multi_target_send(&sender, &packets[0], &dest_refs)
-        {
-            assert!(matches!(ioerror.kind(), ErrorKind::PermissionDenied));
-            assert_eq!(num_failed, 3);
+        match multi_target_send(&sender, &packets[0], &dest_refs) {
+            Ok(()) => panic!(),
+            Err(SendPktsError::IoError(ioerror, num_failed)) => {
+                assert_matches!(ioerror.kind(), ErrorKind::PermissionDenied);
+                assert_eq!(num_failed, 3);
+            }
         }
     }
 }

@@ -4,26 +4,24 @@ use {
         StringAmount,
     },
     bincode::deserialize,
-    solana_sdk::{
-        clock::{Epoch, UnixTimestamp},
-        stake::state::{Authorized, Delegation, Lockup, Meta, Stake, StakeState},
-    },
+    solana_clock::{Epoch, UnixTimestamp},
+    solana_program::stake::state::{Authorized, Delegation, Lockup, Meta, Stake, StakeStateV2},
 };
 
 pub fn parse_stake(data: &[u8]) -> Result<StakeAccountType, ParseAccountError> {
-    let stake_state: StakeState = deserialize(data)
+    let stake_state: StakeStateV2 = deserialize(data)
         .map_err(|_| ParseAccountError::AccountNotParsable(ParsableAccount::Stake))?;
     let parsed_account = match stake_state {
-        StakeState::Uninitialized => StakeAccountType::Uninitialized,
-        StakeState::Initialized(meta) => StakeAccountType::Initialized(UiStakeAccount {
+        StakeStateV2::Uninitialized => StakeAccountType::Uninitialized,
+        StakeStateV2::Initialized(meta) => StakeAccountType::Initialized(UiStakeAccount {
             meta: meta.into(),
             stake: None,
         }),
-        StakeState::Stake(meta, stake) => StakeAccountType::Delegated(UiStakeAccount {
+        StakeStateV2::Stake(meta, stake, _) => StakeAccountType::Delegated(UiStakeAccount {
             meta: meta.into(),
             stake: Some(stake.into()),
         }),
-        StakeState::RewardsPool => StakeAccountType::RewardsPool,
+        StakeStateV2::RewardsPool => StakeAccountType::RewardsPool,
     };
     Ok(parsed_account)
 }
@@ -119,11 +117,16 @@ pub struct UiDelegation {
     pub stake: StringAmount,
     pub activation_epoch: StringAmount,
     pub deactivation_epoch: StringAmount,
+    #[deprecated(
+        since = "1.16.7",
+        note = "Please use `solana_program::stake::stake::warmup_cooldown_rate()` instead"
+    )]
     pub warmup_cooldown_rate: f64,
 }
 
 impl From<Delegation> for UiDelegation {
     fn from(delegation: Delegation) -> Self {
+        #[allow(deprecated)]
         Self {
             voter: delegation.voter_pubkey.to_string(),
             stake: delegation.stake.to_string(),
@@ -136,19 +139,20 @@ impl From<Delegation> for UiDelegation {
 
 #[cfg(test)]
 mod test {
-    use {super::*, bincode::serialize};
+    use {super::*, bincode::serialize, solana_program::stake::stake_flags::StakeFlags};
 
     #[test]
+    #[allow(deprecated)]
     fn test_parse_stake() {
-        let stake_state = StakeState::Uninitialized;
+        let stake_state = StakeStateV2::Uninitialized;
         let stake_data = serialize(&stake_state).unwrap();
         assert_eq!(
             parse_stake(&stake_data).unwrap(),
             StakeAccountType::Uninitialized
         );
 
-        let pubkey = solana_sdk::pubkey::new_rand();
-        let custodian = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
+        let custodian = solana_pubkey::new_rand();
         let authorized = Authorized::auto(&pubkey);
         let lockup = Lockup {
             unix_timestamp: 0,
@@ -161,7 +165,7 @@ mod test {
             lockup,
         };
 
-        let stake_state = StakeState::Initialized(meta);
+        let stake_state = StakeStateV2::Initialized(meta);
         let stake_data = serialize(&stake_state).unwrap();
         assert_eq!(
             parse_stake(&stake_data).unwrap(),
@@ -182,19 +186,19 @@ mod test {
             })
         );
 
-        let voter_pubkey = solana_sdk::pubkey::new_rand();
+        let voter_pubkey = solana_pubkey::new_rand();
         let stake = Stake {
             delegation: Delegation {
                 voter_pubkey,
                 stake: 20,
                 activation_epoch: 2,
-                deactivation_epoch: std::u64::MAX,
+                deactivation_epoch: u64::MAX,
                 warmup_cooldown_rate: 0.25,
             },
             credits_observed: 10,
         };
 
-        let stake_state = StakeState::Stake(meta, stake);
+        let stake_state = StakeStateV2::Stake(meta, stake, StakeFlags::empty());
         let stake_data = serialize(&stake_state).unwrap();
         assert_eq!(
             parse_stake(&stake_data).unwrap(),
@@ -216,7 +220,7 @@ mod test {
                         voter: voter_pubkey.to_string(),
                         stake: 20.to_string(),
                         activation_epoch: 2.to_string(),
-                        deactivation_epoch: std::u64::MAX.to_string(),
+                        deactivation_epoch: u64::MAX.to_string(),
                         warmup_cooldown_rate: 0.25,
                     },
                     credits_observed: 10,
@@ -224,7 +228,7 @@ mod test {
             })
         );
 
-        let stake_state = StakeState::RewardsPool;
+        let stake_state = StakeStateV2::RewardsPool;
         let stake_data = serialize(&stake_state).unwrap();
         assert_eq!(
             parse_stake(&stake_data).unwrap(),

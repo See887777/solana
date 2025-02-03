@@ -1,25 +1,20 @@
 //! Config program
 
 use {
-    crate::ConfigKeys,
-    bincode::deserialize,
-    solana_program_runtime::{ic_msg, invoke_context::InvokeContext},
-    solana_sdk::{
-        feature_set, instruction::InstructionError, program_utils::limited_deserialize,
-        pubkey::Pubkey, transaction_context::IndexOfAccount,
-    },
-    std::collections::BTreeSet,
+    crate::ConfigKeys, bincode::deserialize, solana_bincode::limited_deserialize,
+    solana_instruction::error::InstructionError, solana_log_collector::ic_msg,
+    solana_program_runtime::declare_process_instruction, solana_pubkey::Pubkey,
+    solana_transaction_context::IndexOfAccount, std::collections::BTreeSet,
 };
 
-pub fn process_instruction(
-    _first_instruction_account: IndexOfAccount,
-    invoke_context: &mut InvokeContext,
-) -> Result<(), InstructionError> {
+pub const DEFAULT_COMPUTE_UNITS: u64 = 450;
+
+declare_process_instruction!(Entrypoint, DEFAULT_COMPUTE_UNITS, |invoke_context| {
     let transaction_context = &invoke_context.transaction_context;
     let instruction_context = transaction_context.get_current_instruction_context()?;
     let data = instruction_context.get_instruction_data();
 
-    let key_list: ConfigKeys = limited_deserialize(data)?;
+    let key_list: ConfigKeys = limited_deserialize(data, solana_packet::PACKET_DATA_SIZE as u64)?;
     let config_account_key = transaction_context.get_key_of_account_at_index(
         instruction_context.get_index_of_instruction_account_in_transaction(0)?,
     )?;
@@ -103,16 +98,12 @@ pub fn process_instruction(
         }
     }
 
-    if invoke_context
-        .feature_set
-        .is_active(&feature_set::dedupe_config_program_signers::id())
-    {
-        let total_new_keys = key_list.keys.len();
-        let unique_new_keys = key_list.keys.into_iter().collect::<BTreeSet<_>>();
-        if unique_new_keys.len() != total_new_keys {
-            ic_msg!(invoke_context, "new config contains duplicate keys");
-            return Err(InstructionError::InvalidArgument);
-        }
+    // dedupe signers
+    let total_new_keys = key_list.keys.len();
+    let unique_new_keys = key_list.keys.into_iter().collect::<BTreeSet<_>>();
+    if unique_new_keys.len() != total_new_keys {
+        ic_msg!(invoke_context, "new config contains duplicate keys");
+        return Err(InstructionError::InvalidArgument);
     }
 
     // Check for Config data signers not present in incoming account update
@@ -134,7 +125,7 @@ pub fn process_instruction(
     }
     config_account.get_data_mut()?[..data.len()].copy_from_slice(data);
     Ok(())
-}
+});
 
 #[cfg(test)]
 mod tests {
@@ -143,14 +134,13 @@ mod tests {
         crate::{config_instruction, get_config_data, id, ConfigKeys, ConfigState},
         bincode::serialized_size,
         serde_derive::{Deserialize, Serialize},
+        solana_account::{AccountSharedData, ReadableAccount},
+        solana_instruction::AccountMeta,
+        solana_keypair::Keypair,
         solana_program_runtime::invoke_context::mock_process_instruction,
-        solana_sdk::{
-            account::{AccountSharedData, ReadableAccount},
-            instruction::AccountMeta,
-            pubkey::Pubkey,
-            signature::{Keypair, Signer},
-            system_instruction::SystemInstruction,
-        },
+        solana_pubkey::Pubkey,
+        solana_signer::Signer,
+        solana_system_interface::instruction::SystemInstruction,
     };
 
     fn process_instruction(
@@ -165,10 +155,10 @@ mod tests {
             instruction_data,
             transaction_accounts,
             instruction_accounts,
-            None,
-            None,
             expected_result,
-            super::process_instruction,
+            Entrypoint::vm,
+            |_invoke_context| {},
+            |_invoke_context| {},
         )
     }
 
@@ -202,14 +192,18 @@ mod tests {
         let config_pubkey = config_keypair.pubkey();
         let instructions =
             config_instruction::create_account::<MyConfig>(&from_pubkey, &config_pubkey, 1, keys);
-        let system_instruction = limited_deserialize(&instructions[0].data).unwrap();
-        let space = match system_instruction {
-            SystemInstruction::CreateAccount {
-                lamports: _,
-                space,
-                owner: _,
-            } => space,
-            _ => panic!("Not a CreateAccount system instruction"),
+        let system_instruction = limited_deserialize(
+            &instructions[0].data,
+            solana_packet::PACKET_DATA_SIZE as u64,
+        )
+        .unwrap();
+        let SystemInstruction::CreateAccount {
+            lamports: _,
+            space,
+            owner: _,
+        } = system_instruction
+        else {
+            panic!("Not a CreateAccount system instruction")
         };
         let config_account = AccountSharedData::new(0, space as usize, &id());
         let accounts = process_instruction(

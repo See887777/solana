@@ -18,22 +18,23 @@ use {
     bip39::{Language, Mnemonic, Seed},
     clap::ArgMatches,
     rpassword::prompt_password,
+    solana_derivation_path::{DerivationPath, DerivationPathError},
+    solana_hash::Hash,
+    solana_keypair::{
+        keypair_from_seed, keypair_from_seed_phrase_and_passphrase, read_keypair,
+        read_keypair_file, seed_derivable::keypair_from_seed_and_derivation_path, Keypair,
+    },
+    solana_message::Message,
+    solana_presigner::Presigner,
+    solana_pubkey::Pubkey,
     solana_remote_wallet::{
         locator::{Locator as RemoteWalletLocator, LocatorError as RemoteWalletLocatorError},
         remote_keypair::generate_remote_keypair,
         remote_wallet::{maybe_wallet_manager, RemoteWalletError, RemoteWalletManager},
     },
-    solana_sdk::{
-        derivation_path::{DerivationPath, DerivationPathError},
-        hash::Hash,
-        message::Message,
-        pubkey::Pubkey,
-        signature::{
-            generate_seed_from_seed_phrase_and_passphrase, keypair_from_seed,
-            keypair_from_seed_and_derivation_path, keypair_from_seed_phrase_and_passphrase,
-            read_keypair, read_keypair_file, Keypair, NullSigner, Presigner, Signature, Signer,
-        },
-    },
+    solana_seed_phrase::generate_seed_from_seed_phrase_and_passphrase,
+    solana_signature::Signature,
+    solana_signer::{null_signer::NullSigner, Signer},
     std::{
         cell::RefCell,
         convert::TryFrom,
@@ -41,8 +42,8 @@ use {
         io::{stdin, stdout, Write},
         ops::Deref,
         process::exit,
+        rc::Rc,
         str::FromStr,
-        sync::Arc,
     },
     thiserror::Error,
 };
@@ -207,7 +208,7 @@ impl DefaultSigner {
     /// use clap::{App, Arg, value_t_or_exit};
     /// use solana_clap_utils::keypair::{DefaultSigner, signer_from_path};
     /// use solana_clap_utils::offline::OfflineArgs;
-    /// use solana_sdk::signer::Signer;
+    /// use solana_signer::Signer;
     ///
     /// let clap_app = App::new("my-program")
     ///     // The argument we'll parse as a signer "path"
@@ -242,7 +243,7 @@ impl DefaultSigner {
         &self,
         bulk_signers: Vec<Option<Box<dyn Signer>>>,
         matches: &ArgMatches<'_>,
-        wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+        wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
     ) -> Result<CliSignerInfo, Box<dyn error::Error>> {
         let mut unique_signers = vec![];
 
@@ -304,7 +305,7 @@ impl DefaultSigner {
     pub fn signer_from_path(
         &self,
         matches: &ArgMatches,
-        wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+        wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
     ) -> Result<Box<dyn Signer>, Box<dyn std::error::Error>> {
         signer_from_path(matches, self.path()?, &self.arg_name, wallet_manager)
     }
@@ -357,7 +358,7 @@ impl DefaultSigner {
     pub fn signer_from_path_with_config(
         &self,
         matches: &ArgMatches,
-        wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+        wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
         config: &SignerFromPathConfig,
     ) -> Result<Box<dyn Signer>, Box<dyn std::error::Error>> {
         signer_from_path_with_config(
@@ -370,6 +371,7 @@ impl DefaultSigner {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct SignerSource {
     pub kind: SignerSourceKind,
     pub derivation_path: Option<DerivationPath>,
@@ -686,7 +688,7 @@ pub fn signer_from_path(
     matches: &ArgMatches,
     path: &str,
     keypair_name: &str,
-    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
 ) -> Result<Box<dyn Signer>, Box<dyn error::Error>> {
     let config = SignerFromPathConfig::default();
     signer_from_path_with_config(matches, path, keypair_name, wallet_manager, &config)
@@ -753,7 +755,7 @@ pub fn signer_from_path_with_config(
     matches: &ArgMatches,
     path: &str,
     keypair_name: &str,
-    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
     config: &SignerFromPathConfig,
 ) -> Result<Box<dyn Signer>, Box<dyn error::Error>> {
     let SignerSource {
@@ -860,7 +862,7 @@ pub fn pubkey_from_path(
     matches: &ArgMatches,
     path: &str,
     keypair_name: &str,
-    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
 ) -> Result<Pubkey, Box<dyn error::Error>> {
     let SignerSource { kind, .. } = parse_signer_source(path)?;
     match kind {
@@ -873,7 +875,7 @@ pub fn resolve_signer_from_path(
     matches: &ArgMatches,
     path: &str,
     keypair_name: &str,
-    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
 ) -> Result<Option<String>, Box<dyn error::Error>> {
     let SignerSource {
         kind,
@@ -1120,9 +1122,11 @@ mod tests {
     use {
         super::*,
         crate::offline::OfflineArgs,
+        assert_matches::assert_matches,
         clap::{value_t_or_exit, App, Arg},
+        solana_keypair::write_keypair_file,
         solana_remote_wallet::{locator::Manufacturer, remote_wallet::initialize_wallet_manager},
-        solana_sdk::{signer::keypair::write_keypair_file, system_instruction},
+        solana_system_interface::instruction::transfer,
         tempfile::{NamedTempFile, TempDir},
     };
 
@@ -1143,11 +1147,7 @@ mod tests {
         let nonsigner2 = Keypair::new();
         let recipient = Pubkey::new_unique();
         let message = Message::new(
-            &[system_instruction::transfer(
-                &source.pubkey(),
-                &recipient,
-                42,
-            )],
+            &[transfer(&source.pubkey(), &recipient, 42)],
             Some(&fee_payer.pubkey()),
         );
         let signers = vec![
@@ -1168,31 +1168,31 @@ mod tests {
 
     #[test]
     fn test_parse_signer_source() {
-        assert!(matches!(
+        assert_matches!(
             parse_signer_source(STDOUT_OUTFILE_TOKEN).unwrap(),
             SignerSource {
                 kind: SignerSourceKind::Stdin,
                 derivation_path: None,
                 legacy: false,
             }
-        ));
+        );
         let stdin = "stdin:".to_string();
-        assert!(matches!(
+        assert_matches!(
             parse_signer_source(stdin).unwrap(),
             SignerSource {
                 kind: SignerSourceKind::Stdin,
                 derivation_path: None,
                 legacy: false,
             }
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             parse_signer_source(ASK_KEYWORD).unwrap(),
             SignerSource {
                 kind: SignerSourceKind::Prompt,
                 derivation_path: None,
                 legacy: true,
             }
-        ));
+        );
         let pubkey = Pubkey::new_unique();
         assert!(
             matches!(parse_signer_source(pubkey.to_string()).unwrap(), SignerSource {
@@ -1235,39 +1235,39 @@ mod tests {
             manufacturer: Manufacturer::Ledger,
             pubkey: None,
         };
-        assert!(matches!(parse_signer_source(usb).unwrap(), SignerSource {
+        assert_matches!(parse_signer_source(usb).unwrap(), SignerSource {
                 kind: SignerSourceKind::Usb(u),
                 derivation_path: None,
                 legacy: false,
-            } if u == expected_locator));
+            } if u == expected_locator);
         let usb = "usb://ledger?key=0/0".to_string();
         let expected_locator = RemoteWalletLocator {
             manufacturer: Manufacturer::Ledger,
             pubkey: None,
         };
         let expected_derivation_path = Some(DerivationPath::new_bip44(Some(0), Some(0)));
-        assert!(matches!(parse_signer_source(usb).unwrap(), SignerSource {
+        assert_matches!(parse_signer_source(usb).unwrap(), SignerSource {
                 kind: SignerSourceKind::Usb(u),
                 derivation_path: d,
                 legacy: false,
-            } if u == expected_locator && d == expected_derivation_path));
+            } if u == expected_locator && d == expected_derivation_path);
         // Catchall into SignerSource::Filepath fails
         let junk = "sometextthatisnotapubkeyorfile".to_string();
         assert!(Pubkey::from_str(&junk).is_err());
-        assert!(matches!(
+        assert_matches!(
             parse_signer_source(&junk),
             Err(SignerSourceError::IoError(_))
-        ));
+        );
 
         let prompt = "prompt:".to_string();
-        assert!(matches!(
+        assert_matches!(
             parse_signer_source(prompt).unwrap(),
             SignerSource {
                 kind: SignerSourceKind::Prompt,
                 derivation_path: None,
                 legacy: false,
             }
-        ));
+        );
         assert!(
             matches!(parse_signer_source(format!("file:{absolute_path_str}")).unwrap(), SignerSource {
                 kind: SignerSourceKind::Filepath(p),

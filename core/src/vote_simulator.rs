@@ -1,15 +1,18 @@
+#![cfg(feature = "dev-context-only-utils")]
 use {
     crate::{
         cluster_info_vote_listener::VoteTracker,
-        cluster_slot_state_verifier::{
-            DuplicateSlotsTracker, EpochSlotsFrozenSlots, GossipDuplicateConfirmedSlots,
+        cluster_slots_service::cluster_slots::ClusterSlots,
+        consensus::{
+            fork_choice::{select_vote_and_reset_forks, SelectVoteAndResetForkResult},
+            heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
+            latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
+            progress_map::{ForkProgress, ProgressMap},
+            Tower,
         },
-        cluster_slots::ClusterSlots,
-        consensus::Tower,
-        fork_choice::SelectVoteAndResetForkResult,
-        heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
-        latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
-        progress_map::{ForkProgress, ProgressMap},
+        repair::cluster_slot_state_verifier::{
+            DuplicateConfirmedSlots, DuplicateSlotsTracker, EpochSlotsFrozenSlots,
+        },
         replay_stage::{HeaviestForkFailures, ReplayStage},
         unfrozen_gossip_verified_vote_hashes::UnfrozenGossipVerifiedVoteHashes,
     },
@@ -23,9 +26,12 @@ use {
         },
     },
     solana_sdk::{clock::Slot, hash::Hash, pubkey::Pubkey, signature::Signer},
-    solana_vote_program::vote_transaction,
+    solana_vote_program::{
+        vote_state::{process_vote_unchecked, Lockout, TowerSync},
+        vote_transaction,
+    },
     std::{
-        collections::{HashMap, HashSet},
+        collections::{HashMap, HashSet, VecDeque},
         sync::{Arc, RwLock},
     },
     trees::{tr, Tree, TreeWalk},
@@ -55,12 +61,13 @@ impl VoteSimulator {
             validator_keypairs,
             node_pubkeys,
             vote_pubkeys,
-            bank_forks: Arc::new(RwLock::new(bank_forks)),
+            bank_forks,
             progress,
             heaviest_subtree_fork_choice,
             latest_validator_votes_for_frozen_banks: LatestValidatorVotesForFrozenBanks::default(),
         }
     }
+
     pub fn fill_bank_forks(
         &mut self,
         forks: Tree<u64>,
@@ -80,7 +87,13 @@ impl VoteSimulator {
             }
             let parent = *walk.get_parent().unwrap().data();
             let parent_bank = self.bank_forks.read().unwrap().get(parent).unwrap();
-            let new_bank = Bank::new_from_parent(&parent_bank, &Pubkey::default(), slot);
+            let new_bank = Bank::new_from_parent(parent_bank.clone(), &Pubkey::default(), slot);
+            let new_bank = self
+                .bank_forks
+                .write()
+                .unwrap()
+                .insert(new_bank)
+                .clone_without_scheduler();
             self.progress
                 .entry(slot)
                 .or_insert_with(|| ForkProgress::new(Hash::default(), None, None, 0, 0));
@@ -88,10 +101,34 @@ impl VoteSimulator {
                 if vote.contains(&parent) {
                     let keypairs = self.validator_keypairs.get(pubkey).unwrap();
                     let latest_blockhash = parent_bank.last_blockhash();
-                    let vote_tx = vote_transaction::new_vote_transaction(
-                        // Must vote > root to be processed
-                        vec![parent],
-                        parent_bank.hash(),
+                    let tower_sync = if let Some(vote_account) =
+                        parent_bank.get_vote_account(&keypairs.vote_keypair.pubkey())
+                    {
+                        let mut vote_state = vote_account.vote_state().clone();
+                        process_vote_unchecked(
+                            &mut vote_state,
+                            solana_vote_program::vote_state::Vote::new(
+                                vec![parent],
+                                parent_bank.hash(),
+                            ),
+                        )
+                        .unwrap();
+                        TowerSync::new(
+                            vote_state.votes.iter().map(|vote| vote.lockout).collect(),
+                            vote_state.root_slot,
+                            parent_bank.hash(),
+                            Hash::default(),
+                        )
+                    } else {
+                        TowerSync::new(
+                            VecDeque::from([Lockout::new(parent)]),
+                            Some(root),
+                            parent_bank.hash(),
+                            Hash::default(),
+                        )
+                    };
+                    let vote_tx = vote_transaction::new_tower_sync_transaction(
+                        tower_sync,
                         latest_blockhash,
                         &keypairs.node_keypair,
                         &keypairs.vote_keypair,
@@ -106,18 +143,14 @@ impl VoteSimulator {
                         .get_vote_account(&keypairs.vote_keypair.pubkey())
                         .unwrap();
                     let state = vote_account.vote_state();
-                    assert!(state
-                        .as_ref()
-                        .unwrap()
-                        .votes
-                        .iter()
-                        .any(|lockout| lockout.slot() == parent));
+                    assert!(state.votes.iter().any(|lockout| lockout.slot() == parent));
                 }
             }
             while new_bank.tick_height() < new_bank.max_tick_height() {
-                new_bank.register_tick(&Hash::new_unique());
+                new_bank.register_unique_tick();
             }
             if !visit.node().has_no_child() || is_frozen {
+                new_bank.set_block_id(Some(Hash::new_unique()));
                 new_bank.freeze();
                 self.progress
                     .get_fork_stats_mut(new_bank.slot())
@@ -128,7 +161,6 @@ impl VoteSimulator {
                     Some((new_bank.parent_slot(), new_bank.parent_hash())),
                 );
             }
-            self.bank_forks.write().unwrap().insert(new_bank);
 
             walk.forward();
         }
@@ -141,8 +173,6 @@ impl VoteSimulator {
         tower: &mut Tower,
     ) -> Vec<HeaviestForkFailures> {
         // Try to simulate the vote
-        let my_keypairs = self.validator_keypairs.get(my_pubkey).unwrap();
-        let my_vote_pubkey = my_keypairs.vote_keypair.pubkey();
         let ancestors = self.bank_forks.read().unwrap().ancestors();
         let mut frozen_banks: Vec<_> = self
             .bank_forks
@@ -178,7 +208,7 @@ impl VoteSimulator {
         let SelectVoteAndResetForkResult {
             heaviest_fork_failures,
             ..
-        } = ReplayStage::select_vote_and_reset_forks(
+        } = select_vote_and_reset_forks(
             &vote_bank,
             None,
             &ancestors,
@@ -195,7 +225,7 @@ impl VoteSimulator {
             return heaviest_fork_failures;
         }
 
-        let new_root = tower.record_bank_vote(&vote_bank, &my_vote_pubkey);
+        let new_root = tower.record_bank_vote(&vote_bank);
         if let Some(new_root) = new_root {
             self.set_root(new_root);
         }
@@ -213,13 +243,14 @@ impl VoteSimulator {
             None,
             &mut self.heaviest_subtree_fork_choice,
             &mut DuplicateSlotsTracker::default(),
-            &mut GossipDuplicateConfirmedSlots::default(),
+            &mut DuplicateConfirmedSlots::default(),
             &mut UnfrozenGossipVerifiedVoteHashes::default(),
             &mut true,
             &mut Vec::new(),
             &mut EpochSlotsFrozenSlots::default(),
             &drop_bank_sender,
         )
+        .unwrap()
     }
 
     pub fn create_and_vote_new_branch(
@@ -261,6 +292,15 @@ impl VoteSimulator {
             .push((lockout_interval.0, *vote_account_pubkey));
     }
 
+    pub fn clear_lockout_intervals(&mut self, slot: Slot) {
+        self.progress
+            .entry(slot)
+            .or_insert_with(|| ForkProgress::new(Hash::default(), None, None, 0, 0))
+            .fork_stats
+            .lockout_intervals
+            .clear()
+    }
+
     pub fn can_progress_on_fork(
         &mut self,
         my_pubkey: &Pubkey,
@@ -296,13 +336,14 @@ impl VoteSimulator {
         false
     }
 
+    #[allow(clippy::type_complexity)]
     fn init_state(
         num_keypairs: usize,
     ) -> (
         HashMap<Pubkey, ValidatorVoteKeypairs>,
         Vec<Pubkey>,
         Vec<Pubkey>,
-        BankForks,
+        Arc<RwLock<BankForks>>,
         ProgressMap,
         HeaviestSubtreeForkChoice,
     ) {
@@ -338,7 +379,11 @@ impl VoteSimulator {
 pub fn initialize_state(
     validator_keypairs_map: &HashMap<Pubkey, ValidatorVoteKeypairs>,
     stake: u64,
-) -> (BankForks, ProgressMap, HeaviestSubtreeForkChoice) {
+) -> (
+    Arc<RwLock<BankForks>>,
+    ProgressMap,
+    HeaviestSubtreeForkChoice,
+) {
     let validator_keypairs: Vec<_> = validator_keypairs_map.values().collect();
     let GenesisConfigInfo {
         mut genesis_config,
@@ -351,14 +396,15 @@ pub fn initialize_state(
     );
 
     genesis_config.poh_config.hashes_per_tick = Some(2);
-    let bank0 = Bank::new_for_tests(&genesis_config);
+    let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    bank0.set_block_id(Some(Hash::new_unique()));
 
     for pubkey in validator_keypairs_map.keys() {
         bank0.transfer(10_000, &mint_keypair, pubkey).unwrap();
     }
 
     while bank0.tick_height() < bank0.max_tick_height() {
-        bank0.register_tick(&Hash::new_unique());
+        bank0.register_unique_tick();
     }
     bank0.freeze();
     let mut progress = ProgressMap::default();
@@ -366,7 +412,7 @@ pub fn initialize_state(
         0,
         ForkProgress::new_from_bank(&bank0, bank0.collector_id(), &Pubkey::default(), None, 0, 0),
     );
-    let bank_forks = BankForks::new(bank0);
-    let heaviest_subtree_fork_choice = HeaviestSubtreeForkChoice::new_from_bank_forks(&bank_forks);
+    let heaviest_subtree_fork_choice =
+        HeaviestSubtreeForkChoice::new_from_bank_forks(bank_forks.clone());
     (bank_forks, progress, heaviest_subtree_fork_choice)
 }

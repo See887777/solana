@@ -1,4 +1,4 @@
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 #![feature(test)]
 
 extern crate test;
@@ -79,6 +79,6 @@ fn bench_shrink_count_packets(bencher: &mut Bencher) {
     });
 
     bencher.iter(|| {
-        let _ = sigverify::count_valid_packets(&batches, |_| ());
+        let _ = sigverify::count_valid_packets(&batches);
     });
 }

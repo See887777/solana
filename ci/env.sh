@@ -6,21 +6,7 @@
 
 if [[ -n $CI ]]; then
   export CI=1
-  if [[ -n $TRAVIS ]]; then
-    export CI_BRANCH=$TRAVIS_BRANCH
-    export CI_BASE_BRANCH=$TRAVIS_BRANCH
-    export CI_BUILD_ID=$TRAVIS_BUILD_ID
-    export CI_COMMIT=$TRAVIS_COMMIT
-    export CI_JOB_ID=$TRAVIS_JOB_ID
-    if [[ $TRAVIS_PULL_REQUEST != false ]]; then
-      export CI_PULL_REQUEST=true
-    else
-      export CI_PULL_REQUEST=
-    fi
-    export CI_OS_NAME=$TRAVIS_OS_NAME
-    export CI_REPO_SLUG=$TRAVIS_REPO_SLUG
-    export CI_TAG=$TRAVIS_TAG
-  elif [[ -n $BUILDKITE ]]; then
+  if [[ -n $BUILDKITE ]]; then
     export CI_BRANCH=$BUILDKITE_BRANCH
     export CI_BUILD_ID=$BUILDKITE_BUILD_ID
     if [[ $BUILDKITE_COMMIT = HEAD ]]; then
@@ -116,6 +102,7 @@ if [[ -n $CI ]]; then
 else
   export CI=
   export CI_BRANCH=
+  export CI_BASE_BRANCH=
   export CI_BUILD_ID=
   export CI_COMMIT=
   export CI_JOB_ID=
@@ -131,10 +118,12 @@ fi
 cat <<EOF
 CI=$CI
 CI_BRANCH=$CI_BRANCH
+CI_BASE_BRANCH=$CI_BASE_BRANCH
 CI_BUILD_ID=$CI_BUILD_ID
 CI_COMMIT=$CI_COMMIT
 CI_JOB_ID=$CI_JOB_ID
-CI_OS_NAME=$CI_OS_NAME
 CI_PULL_REQUEST=$CI_PULL_REQUEST
+CI_OS_NAME=$CI_OS_NAME
+CI_REPO_SLUG=$CI_REPO_SLUG
 CI_TAG=$CI_TAG
 EOF

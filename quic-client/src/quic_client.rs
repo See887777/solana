@@ -12,7 +12,7 @@ use {
         connection_cache_stats::ConnectionCacheStats,
         nonblocking::client_connection::ClientConnection as NonblockingClientConnection,
     },
-    solana_sdk::transport::{Result as TransportResult, TransportError},
+    solana_transaction_error::{TransportError, TransportResult},
     std::{
         net::SocketAddr,
         sync::{atomic::Ordering, Arc, Condvar, Mutex, MutexGuard},
@@ -22,11 +22,11 @@ use {
 };
 
 pub const MAX_OUTSTANDING_TASK: u64 = 2000;
-pub const SEND_DATA_TIMEOUT_MS: u64 = 10000;
+const SEND_DATA_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A semaphore used for limiting the number of asynchronous tasks spawn to the
 /// runtime. Before spawnning a task, use acquire. After the task is done (be it
-/// succsess or failure), call release.
+/// success or failure), call release.
 struct AsyncTaskSemaphore {
     /// Keep the counter info about the usage
     counter: Mutex<u64>,
@@ -69,7 +69,7 @@ lazy_static! {
     static ref ASYNC_TASK_SEMAPHORE: AsyncTaskSemaphore =
         AsyncTaskSemaphore::new(MAX_OUTSTANDING_TASK);
     static ref RUNTIME: Runtime = tokio::runtime::Builder::new_multi_thread()
-        .thread_name("quic-client")
+        .thread_name("solQuicClientRt")
         .enable_all()
         .build()
         .unwrap();
@@ -79,11 +79,7 @@ async fn send_data_async(
     connection: Arc<NonblockingQuicConnection>,
     buffer: Vec<u8>,
 ) -> TransportResult<()> {
-    let result = timeout(
-        Duration::from_millis(SEND_DATA_TIMEOUT_MS),
-        connection.send_data(&buffer),
-    )
-    .await;
+    let result = timeout(SEND_DATA_TIMEOUT, connection.send_data(&buffer)).await;
     ASYNC_TASK_SEMAPHORE.release();
     handle_send_result(result, connection)
 }
@@ -92,10 +88,10 @@ async fn send_data_batch_async(
     connection: Arc<NonblockingQuicConnection>,
     buffers: Vec<Vec<u8>>,
 ) -> TransportResult<()> {
-    let time_out = SEND_DATA_TIMEOUT_MS * buffers.len() as u64;
-
     let result = timeout(
-        Duration::from_millis(time_out),
+        u32::try_from(buffers.len())
+            .map(|size| SEND_DATA_TIMEOUT.saturating_mul(size))
+            .unwrap_or(Duration::MAX),
         connection.send_data_batch(&buffers),
     )
     .await;
@@ -165,14 +161,14 @@ impl ClientConnection for QuicClientConnection {
         let _lock = ASYNC_TASK_SEMAPHORE.acquire();
         let inner = self.inner.clone();
 
-        let _handle = RUNTIME.spawn(async move { send_data_async(inner, data).await });
+        let _handle = RUNTIME.spawn(send_data_async(inner, data));
         Ok(())
     }
 
     fn send_data_batch_async(&self, buffers: Vec<Vec<u8>>) -> TransportResult<()> {
         let _lock = ASYNC_TASK_SEMAPHORE.acquire();
         let inner = self.inner.clone();
-        let _handle = RUNTIME.spawn(async move { send_data_batch_async(inner, buffers).await });
+        let _handle = RUNTIME.spawn(send_data_batch_async(inner, buffers));
         Ok(())
     }
 

@@ -1,23 +1,22 @@
 //! A command-line executable for monitoring the health of a cluster
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 
 use {
     clap::{crate_description, crate_name, value_t, value_t_or_exit, App, Arg},
     log::*,
     solana_clap_utils::{
+        hidden_unless_forced,
         input_parsers::pubkeys_of,
-        input_validators::{is_parsable, is_pubkey_or_keypair, is_url},
+        input_validators::{is_parsable, is_pubkey_or_keypair, is_url, is_valid_percentage},
     },
     solana_cli_output::display::format_labeled_address,
+    solana_hash::Hash,
     solana_metrics::{datapoint_error, datapoint_info},
+    solana_native_token::{sol_to_lamports, Sol},
     solana_notifier::{NotificationType, Notifier},
+    solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::{client_error, response::RpcVoteAccountStatus},
-    solana_sdk::{
-        hash::Hash,
-        native_token::{sol_to_lamports, Sol},
-        pubkey::Pubkey,
-    },
     std::{
         collections::HashMap,
         error,
@@ -34,6 +33,7 @@ struct Config {
     rpc_timeout: Duration,
     minimum_validator_identity_balance: u64,
     monitor_active_stake: bool,
+    active_stake_alert_threshold: u8,
     unhealthy_threshold: usize,
     validator_identity_pubkeys: Vec<Pubkey>,
     name_suffix: String,
@@ -45,7 +45,7 @@ fn get_config() -> Config {
         .version(solana_version::version!())
         .after_help("ADDITIONAL HELP:
         To receive a Slack, Discord, PagerDuty and/or Telegram notification on sanity failure,
-        define environment variables before running `solana-watchtower`:
+        define environment variables before running `agave-watchtower`:
 
         export SLACK_WEBHOOK=...
         export DISCORD_WEBHOOK=...
@@ -61,7 +61,7 @@ fn get_config() -> Config {
 
         To receive a Twilio SMS notification on failure, having a Twilio account,
         and a sending number owned by that account,
-        define environment variable before running `solana-watchtower`:
+        define environment variable before running `agave-watchtower`:
 
         export TWILIO_CONFIG='ACCOUNT=<account>,TOKEN=<securityToken>,TO=<receivingNumber>,FROM=<sendingNumber>'")
         .arg({
@@ -132,13 +132,22 @@ fn get_config() -> Config {
             // Deprecated parameter, now always enabled
             Arg::with_name("no_duplicate_notifications")
                 .long("no-duplicate-notifications")
-                .hidden(true)
+                .hidden(hidden_unless_forced())
         )
         .arg(
             Arg::with_name("monitor_active_stake")
                 .long("monitor-active-stake")
                 .takes_value(false)
-                .help("Alert when the current stake for the cluster drops below 80%"),
+                .help("Alert when the current stake for the cluster drops below the amount specified by --active-stake-alert-threshold"),
+        )
+        .arg(
+            Arg::with_name("active_stake_alert_threshold")
+                .long("active-stake-alert-threshold")
+                .value_name("PERCENTAGE")
+                .takes_value(true)
+                .validator(is_valid_percentage)
+                .default_value("80")
+                .help("Alert when the current stake for the cluster drops below this value"),
         )
         .arg(
             Arg::with_name("ignore_http_bad_gateway")
@@ -155,7 +164,7 @@ fn get_config() -> Config {
                 .value_name("SUFFIX")
                 .takes_value(true)
                 .default_value("")
-                .help("Add this string into all notification messages after \"solana-watchtower\"")
+                .help("Add this string into all notification messages after \"agave-watchtower\"")
         )
         .get_matches();
 
@@ -182,6 +191,8 @@ fn get_config() -> Config {
         .collect();
 
     let monitor_active_stake = matches.is_present("monitor_active_stake");
+    let active_stake_alert_threshold =
+        value_t_or_exit!(matches, "active_stake_alert_threshold", u8);
     let ignore_http_bad_gateway = matches.is_present("ignore_http_bad_gateway");
 
     let name_suffix = value_t_or_exit!(matches, "name_suffix", String);
@@ -194,6 +205,7 @@ fn get_config() -> Config {
         rpc_timeout,
         minimum_validator_identity_balance,
         monitor_active_stake,
+        active_stake_alert_threshold,
         unhealthy_threshold,
         validator_identity_pubkeys,
         name_suffix,
@@ -232,7 +244,7 @@ fn get_cluster_info(
 }
 
 fn main() -> Result<(), Box<dyn error::Error>> {
-    solana_logger::setup_with_default("solana=info");
+    solana_logger::setup_with_default_filter();
     solana_metrics::set_panic_hook("watchtower", /*version:*/ None);
 
     let config = get_config();
@@ -300,7 +312,9 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                     ));
                 }
 
-                if config.monitor_active_stake && current_stake_percent < 80. {
+                if config.monitor_active_stake
+                    && current_stake_percent < config.active_stake_alert_threshold as f64
+                {
                     failures.push((
                         "current-stake",
                         format!("Current stake is {current_stake_percent:.2}%"),
@@ -365,7 +379,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
         if let Some((failure_test_name, failure_error_message)) = &failure {
             let notification_msg = format!(
-                "solana-watchtower{}: Error: {}: {}",
+                "agave-watchtower{}: Error: {}: {}",
                 config.name_suffix, failure_test_name, failure_error_message
             );
             num_consecutive_failures += 1;
@@ -399,7 +413,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 );
                 info!("{}", all_clear_msg);
                 notifier.send(
-                    &format!("solana-watchtower{}: {}", config.name_suffix, all_clear_msg),
+                    &format!("agave-watchtower{}: {}", config.name_suffix, all_clear_msg),
                     &NotificationType::Resolve { incident },
                 );
             }

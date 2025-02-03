@@ -8,16 +8,16 @@ use {
     console::{style, Emoji},
     crossbeam_channel::unbounded,
     indicatif::{ProgressBar, ProgressStyle},
-    serde::{Deserialize, Serialize},
+    serde_derive::{Deserialize, Serialize},
     solana_config_program::{config_instruction, get_config_data, ConfigState},
+    solana_hash::Hash,
+    solana_keypair::{read_keypair_file, signable::Signable, Keypair},
+    solana_message::Message,
+    solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        hash::{Hash, Hasher},
-        message::Message,
-        pubkey::Pubkey,
-        signature::{read_keypair_file, Keypair, Signable, Signer},
-        transaction::Transaction,
-    },
+    solana_sha256_hasher::Hasher,
+    solana_signer::Signer,
+    solana_transaction::Transaction,
     std::{
         fs::{self, File},
         io::{self, BufReader, Read},
@@ -130,9 +130,8 @@ fn download_to_temp(
 
     impl<R: Read> Read for DownloadProgress<R> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.response.read(buf).map(|n| {
+            self.response.read(buf).inspect(|&n| {
                 self.progress_bar.inc(n as u64);
-                n
             })
         }
     }
@@ -333,9 +332,7 @@ pub fn string_from_winreg_value(val: &winreg::RegValue) -> Option<String> {
             let words = unsafe {
                 slice::from_raw_parts(val.bytes.as_ptr() as *const u16, val.bytes.len() / 2)
             };
-            let mut s = if let Ok(s) = String::from_utf16(words) {
-                s
-            } else {
+            let Ok(mut s) = String::from_utf16(words) else {
                 return None;
             };
             while s.ends_with('\u{0}') {
@@ -392,11 +389,9 @@ fn add_to_path(new_path: &str) -> bool {
         },
     };
 
-    let old_path = if let Some(s) =
+    let Some(old_path) =
         get_windows_path_var().unwrap_or_else(|err| panic!("Unable to get PATH: {}", err))
-    {
-        s
-    } else {
+    else {
         return false;
     };
 
@@ -429,7 +424,7 @@ fn add_to_path(new_path: &str) -> bool {
                 HWND_BROADCAST,
                 WM_SETTINGCHANGE,
                 0_usize,
-                "Environment\0".as_ptr() as LPARAM,
+                c"Environment".as_ptr() as LPARAM,
                 SMTO_ABORTIFHUNG,
                 5000,
                 ptr::null_mut(),
@@ -501,7 +496,6 @@ fn add_to_path(new_path: &str) -> bool {
                     fn append_file(dest: &Path, line: &str) -> io::Result<()> {
                         use std::io::Write;
                         let mut dest_file = fs::OpenOptions::new()
-                            .write(true)
                             .append(true)
                             .create(true)
                             .open(dest)?;
@@ -513,7 +507,7 @@ fn add_to_path(new_path: &str) -> bool {
                         Ok(())
                     }
                     append_file(&rcfile, &shell_export_string).unwrap_or_else(|err| {
-                        format!("Unable to append to {rcfile:?}: {err}");
+                        println!("Unable to append to {rcfile:?}: {err}");
                     });
                     modified_rcfiles = true;
                 }
@@ -541,7 +535,7 @@ pub fn init(
     explicit_release: Option<ExplicitRelease>,
 ) -> Result<(), String> {
     let config = {
-        // Write new config file only if different, so that running |solana-install init|
+        // Write new config file only if different, so that running |agave-install init|
         // repeatedly doesn't unnecessarily re-download
         let mut current_config = Config::load(config_file).unwrap_or_default();
         current_config.current_update_manifest = None;
@@ -573,7 +567,7 @@ pub fn init(
 
 fn github_release_download_url(release_semver: &str) -> String {
     format!(
-        "https://github.com/solana-labs/solana/releases/download/v{}/solana-release-{}.tar.bz2",
+        "https://github.com/anza-xyz/agave/releases/download/v{}/solana-release-{}.tar.bz2",
         release_semver,
         crate::build_env::TARGET
     )
@@ -581,7 +575,7 @@ fn github_release_download_url(release_semver: &str) -> String {
 
 fn release_channel_download_url(release_channel: &str) -> String {
     format!(
-        "https://release.solana.com/{}/solana-release-{}.tar.bz2",
+        "https://release.anza.xyz/{}/solana-release-{}.tar.bz2",
         release_channel,
         crate::build_env::TARGET
     )
@@ -589,7 +583,7 @@ fn release_channel_download_url(release_channel: &str) -> String {
 
 fn release_channel_version_url(release_channel: &str) -> String {
     format!(
-        "https://release.solana.com/{}/solana-release-{}.yml",
+        "https://release.anza.xyz/{}/solana-release-{}.yml",
         release_channel,
         crate::build_env::TARGET
     )
@@ -871,7 +865,7 @@ fn check_for_newer_github_release(
     prerelease_allowed: bool,
 ) -> Result<Option<String>, String> {
     let client = reqwest::blocking::Client::builder()
-        .user_agent("solana-install")
+        .user_agent("agave-install")
         .build()
         .map_err(|err| err.to_string())?;
 
@@ -906,7 +900,7 @@ fn check_for_newer_github_release(
 
     while page == 1 || releases.len() == PER_PAGE {
         let url = reqwest::Url::parse_with_params(
-            "https://api.github.com/repos/solana-labs/solana/releases",
+            "https://api.github.com/repos/anza-xyz/agave/releases",
             &[
                 ("per_page", &format!("{PER_PAGE}")),
                 ("page", &format!("{page}")),
@@ -968,58 +962,62 @@ pub fn update(config_file: &str, check_only: bool) -> Result<bool, String> {
 pub fn init_or_update(config_file: &str, is_init: bool, check_only: bool) -> Result<bool, String> {
     let mut config = Config::load(config_file)?;
 
-    let semver_update_type = if is_init {
-        SemverUpdateType::Fixed
-    } else {
-        SemverUpdateType::Patch
-    };
-
     let (updated_version, download_url_and_sha256, release_dir) = if let Some(explicit_release) =
         &config.explicit_release
     {
         match explicit_release {
             ExplicitRelease::Semver(current_release_semver) => {
-                let progress_bar = new_spinner_progress_bar();
-                progress_bar.set_message(format!("{LOOKING_GLASS}Checking for updates..."));
+                let release_dir = config.release_dir(current_release_semver);
+                if is_init && release_dir.exists() {
+                    (current_release_semver.to_owned(), None, release_dir)
+                } else {
+                    let progress_bar = new_spinner_progress_bar();
+                    progress_bar.set_message(format!("{LOOKING_GLASS}Checking for updates..."));
 
-                let github_release = check_for_newer_github_release(
-                    current_release_semver,
-                    semver_update_type,
-                    is_init,
-                )?;
+                    let semver_update_type = if is_init {
+                        SemverUpdateType::Fixed
+                    } else {
+                        SemverUpdateType::Patch
+                    };
+                    let github_release = check_for_newer_github_release(
+                        current_release_semver,
+                        semver_update_type,
+                        is_init,
+                    )?;
 
-                progress_bar.finish_and_clear();
+                    progress_bar.finish_and_clear();
 
-                match github_release {
-                    None => {
-                        return Err(format!("Unknown release: {current_release_semver}"));
-                    }
-                    Some(release_semver) => {
-                        if release_semver == *current_release_semver {
-                            if let Ok(active_release_version) = load_release_version(
-                                &config.active_release_dir().join("version.yml"),
-                            ) {
-                                if format!("v{current_release_semver}")
-                                    == active_release_version.channel
-                                {
-                                    println!(
+                    match github_release {
+                        None => {
+                            return Err(format!("Unknown release: {current_release_semver}"));
+                        }
+                        Some(release_semver) => {
+                            if release_semver == *current_release_semver {
+                                if let Ok(active_release_version) = load_release_version(
+                                    &config.active_release_dir().join("version.yml"),
+                                ) {
+                                    if format!("v{current_release_semver}")
+                                        == active_release_version.channel
+                                    {
+                                        println!(
                                         "Install is up to date. {release_semver} is the latest compatible release"
                                     );
-                                    return Ok(false);
+                                        return Ok(false);
+                                    }
                                 }
                             }
-                        }
-                        config.explicit_release =
-                            Some(ExplicitRelease::Semver(release_semver.clone()));
+                            config.explicit_release =
+                                Some(ExplicitRelease::Semver(release_semver.clone()));
 
-                        let release_dir = config.release_dir(&release_semver);
-                        let download_url_and_sha256 = if release_dir.exists() {
-                            // Release already present in the cache
-                            None
-                        } else {
-                            Some((github_release_download_url(&release_semver), None))
-                        };
-                        (release_semver, download_url_and_sha256, release_dir)
+                            let release_dir = config.release_dir(&release_semver);
+                            let download_url_and_sha256 = if release_dir.exists() {
+                                // Release already present in the cache
+                                None
+                            } else {
+                                Some((github_release_download_url(&release_semver), None))
+                            };
+                            (release_semver, download_url_and_sha256, release_dir)
+                        }
                     }
                 }
             }
@@ -1159,7 +1157,10 @@ pub fn init_or_update(config_file: &str, is_init: bool, check_only: bool) -> Res
     // Trigger an update to the modification time for `release_dir`
     {
         let path = &release_dir.join(".touch");
-        let _ = fs::OpenOptions::new().create(true).write(true).open(path);
+        let _ = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path);
         let _ = fs::remove_file(path);
     }
 
@@ -1168,13 +1169,17 @@ pub fn init_or_update(config_file: &str, is_init: bool, check_only: bool) -> Res
         release_dir.join("solana-release"),
         config.active_release_dir(),
     )
-    .map_err(|err| {
-        format!(
+    .map_err(|err| match err.raw_os_error() {
+        #[cfg(windows)]
+        Some(os_err) if os_err == winapi::shared::winerror::ERROR_PRIVILEGE_NOT_HELD as i32 => {
+            "You need to run this command with administrator privileges.".to_string()
+        }
+        _ => format!(
             "Unable to symlink {:?} to {:?}: {}",
             release_dir,
             config.active_release_dir(),
             err
-        )
+        ),
     })?;
 
     config.save(config_file)?;
@@ -1282,4 +1287,36 @@ pub fn run(
             std::process::exit(0);
         }
     }
+}
+
+pub fn list(config_file: &str) -> Result<(), String> {
+    let config = Config::load(config_file)?;
+
+    let entries = fs::read_dir(&config.releases_dir).map_err(|err| {
+        format!(
+            "Failed to read install directory, \
+            double check that your configuration file is correct: {err}"
+        )
+    })?;
+
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let dir_name = entry.file_name();
+                let current_version =
+                    load_release_version(&config.active_release_dir().join("version.yml"))?.channel;
+
+                let current = if current_version.contains(dir_name.to_string_lossy().as_ref()) {
+                    " (current)"
+                } else {
+                    ""
+                };
+                println!("{}{}", dir_name.to_string_lossy(), current);
+            }
+            Err(err) => {
+                eprintln!("error listing installed versions: {err:?}");
+            }
+        };
+    }
+    Ok(())
 }

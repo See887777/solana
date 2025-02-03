@@ -1,9 +1,12 @@
 //! The `Poh` module provides an object for generating a Proof of History.
 use {
     log::*,
-    solana_sdk::hash::{hash, hashv, Hash},
+    solana_hash::Hash,
+    solana_sha256_hasher::{hash, hashv},
     std::time::{Duration, Instant},
 };
+
+const LOW_POWER_MODE: u64 = u64::MAX;
 
 pub struct Poh {
     pub hash: Hash,
@@ -26,7 +29,7 @@ impl Poh {
     }
 
     pub fn new_with_slot_info(hash: Hash, hashes_per_tick: Option<u64>, tick_number: u64) -> Self {
-        let hashes_per_tick = hashes_per_tick.unwrap_or(std::u64::MAX);
+        let hashes_per_tick = hashes_per_tick.unwrap_or(LOW_POWER_MODE);
         assert!(hashes_per_tick > 1);
         let now = Instant::now();
         Poh {
@@ -90,9 +93,9 @@ impl Poh {
         self.num_hashes += 1;
         self.remaining_hashes -= 1;
 
-        // If the hashes_per_tick is variable (std::u64::MAX) then always generate a tick.
+        // If we are in low power mode then always generate a tick.
         // Otherwise only tick if there are no remaining hashes
-        if self.hashes_per_tick < std::u64::MAX && self.remaining_hashes != 0 {
+        if self.hashes_per_tick != LOW_POWER_MODE && self.remaining_hashes != 0 {
             return None;
         }
 
@@ -107,27 +110,28 @@ impl Poh {
     }
 }
 
-pub fn compute_hash_time_ns(hashes_sample_size: u64) -> u64 {
+pub fn compute_hash_time(hashes_sample_size: u64) -> Duration {
     info!("Running {} hashes...", hashes_sample_size);
     let mut v = Hash::default();
     let start = Instant::now();
     for _ in 0..hashes_sample_size {
         v = hash(v.as_ref());
     }
-    start.elapsed().as_nanos() as u64
+    start.elapsed()
 }
 
 pub fn compute_hashes_per_tick(duration: Duration, hashes_sample_size: u64) -> u64 {
-    let elapsed = compute_hash_time_ns(hashes_sample_size) / (1000 * 1000);
-    duration.as_millis() as u64 * hashes_sample_size / elapsed
+    let elapsed_ms = compute_hash_time(hashes_sample_size).as_millis() as u64;
+    duration.as_millis() as u64 * hashes_sample_size / elapsed_ms
 }
 
 #[cfg(test)]
 mod tests {
     use {
         crate::poh::{Poh, PohEntry},
-        matches::assert_matches,
-        solana_sdk::hash::{hash, hashv, Hash},
+        assert_matches::assert_matches,
+        solana_hash::Hash,
+        solana_sha256_hasher::{hash, hashv},
         std::time::Duration,
     };
 
@@ -180,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "assertion failed: hashes_per_tick > 1")]
+    #[should_panic(expected = "hashes_per_tick > 1")]
     fn test_target_poh_time_hashes_per_tick() {
         let zero = Hash::default();
         let poh = Poh::new(zero, Some(0));

@@ -14,8 +14,48 @@ if [[ -n $CI_PULL_REQUEST ]]; then
   pr_number=${BASH_REMATCH[1]}
   echo "get affected files from PR: $pr_number"
 
+  if [[ $BUILDKITE_REPO =~ ^https:\/\/github\.com\/([^\/]+)\/([^\/\.]+) ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+  elif [[ $BUILDKITE_REPO =~ ^git@github\.com:([^\/]+)\/([^\/\.]+) ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+  else
+    echo "couldn't parse owner and repo. use defaults"
+    owner="anza-xyz"
+    repo="agave"
+  fi
+
+  # ref: https://github.com/cli/cli/issues/5368#issuecomment-1087515074
+  #
+  # Variable value contains dollar prefixed words that look like bash variable
+  # references.  This is intentional.
+  # shellcheck disable=SC2016
+  query='
+  query($owner: String!, $repo: String!, $pr: Int!, $endCursor: String) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $pr) {
+        files(first: 100, after: $endCursor) {
+          pageInfo{ hasNextPage, endCursor }
+          nodes {
+            path
+          }
+        }
+      }
+    }
+  }'
+
   # get affected files
-  readarray -t affected_files < <(gh pr diff --name-only "$pr_number")
+  readarray -t affected_files < <(
+    gh api graphql \
+      -f query="$query" \
+      -F pr="$pr_number" \
+      -F owner="$owner" \
+      -F repo="$repo" \
+      --paginate \
+      --jq '.data.repository.pullRequest.files.nodes.[].path'
+  )
+
   if [[ ${#affected_files[*]} -eq 0 ]]; then
     echo "Unable to determine the files affected by this PR"
     exit 1
@@ -30,7 +70,7 @@ annotate() {
   fi
 }
 
-# Assume everyting needs to be tested when this file or any Dockerfile changes
+# Assume everything needs to be tested when this file or any Dockerfile changes
 mandatory_affected_files=()
 mandatory_affected_files+=(^ci/buildkite-pipeline.sh)
 mandatory_affected_files+=(^ci/docker-rust/Dockerfile)
@@ -121,10 +161,11 @@ EOF
 
 trigger_secondary_step() {
   cat  >> "$output_file" <<"EOF"
-  - name: "Trigger Build on solana-secondary"
-    trigger: "solana-secondary"
+  - name: "Trigger Build on agave-secondary"
+    trigger: "agave-secondary"
     branches: "!pull/*"
     async: true
+    soft_fail: true
     build:
       message: "${BUILDKITE_MESSAGE}"
       commit: "${BUILDKITE_COMMIT}"
@@ -139,35 +180,26 @@ wait_step() {
 }
 
 all_test_steps() {
-  command_step checks ". ci/rust-version.sh; ci/docker-run.sh \$\$rust_nightly_docker_image ci/test-checks.sh" 20 check
+  command_step checks1 "ci/docker-run-default-image.sh ci/test-checks.sh" 20 check
+  command_step dcou-1-of-3 "ci/docker-run-default-image.sh ci/test-dev-context-only-utils.sh --partition 1/3" 20 check
+  command_step dcou-2-of-3 "ci/docker-run-default-image.sh ci/test-dev-context-only-utils.sh --partition 2/3" 20 check
+  command_step dcou-3-of-3 "ci/docker-run-default-image.sh ci/test-dev-context-only-utils.sh --partition 3/3" 20 check
+  command_step miri "ci/docker-run-default-image.sh ci/test-miri.sh" 5 check
+  command_step frozen-abi "ci/docker-run-default-image.sh ./test-abi.sh" 15 check
   wait_step
 
-  # Coverage...
+  # Full test suite
+  .buildkite/scripts/build-stable.sh >> "$output_file"
+
+  # Docs tests
   if affects \
              .rs$ \
              Cargo.lock$ \
              Cargo.toml$ \
              ^ci/rust-version.sh \
-             ^ci/test-coverage.sh \
-             ^scripts/coverage.sh \
-      ; then
-    command_step coverage ". ci/rust-version.sh; ci/docker-run.sh \$\$rust_nightly_docker_image ci/test-coverage.sh" 80
-    wait_step
-  else
-    annotate --style info --context test-coverage \
-      "Coverage skipped as no .rs files were modified"
-  fi
-
-  # Full test suite
-  command_step stable ". ci/rust-version.sh; ci/docker-run.sh \$\$rust_stable_docker_image ci/test-stable.sh" 70
-
-  # Docs tests
-  if affects \
-             .rs$ \
-             ^ci/rust-version.sh \
              ^ci/test-docs.sh \
       ; then
-    command_step doctest "ci/test-docs.sh" 15
+    command_step doctest "ci/docker-run-default-image.sh ci/test-docs.sh" 15
   else
     annotate --style info --context test-docs \
       "Docs skipped as no .rs files were modified"
@@ -185,15 +217,14 @@ all_test_steps() {
              ^ci/test-local-cluster.sh \
              ^core/build.rs \
              ^fetch-perf-libs.sh \
+             ^platform-tools-sdk/ \
              ^programs/ \
              ^sdk/ \
-             cargo-build-bpf$ \
-             cargo-test-bpf$ \
              cargo-build-sbf$ \
              cargo-test-sbf$ \
       ; then
     cat >> "$output_file" <<"EOF"
-  - command: "ci/test-stable-sbf.sh"
+  - command: "ci/docker-run-default-image.sh ci/test-stable-sbf.sh"
     name: "stable-sbf"
     timeout_in_minutes: 35
     artifact_paths: "sbf-dumps.tar.bz2"
@@ -205,31 +236,17 @@ EOF
       "Stable-SBF skipped as no relevant files were modified"
   fi
 
-  # Perf test suite
+   # Shuttle tests
   if affects \
              .rs$ \
              Cargo.lock$ \
              Cargo.toml$ \
              ^ci/rust-version.sh \
-             ^ci/test-stable-perf.sh \
-             ^ci/test-stable.sh \
-             ^ci/test-local-cluster.sh \
-             ^core/build.rs \
-             ^fetch-perf-libs.sh \
-             ^programs/ \
-             ^sdk/ \
       ; then
-    cat >> "$output_file" <<"EOF"
-  - command: "ci/test-stable-perf.sh"
-    name: "stable-perf"
-    timeout_in_minutes: 35
-    artifact_paths: "log-*.txt"
-    agents:
-      queue: "cuda"
-EOF
+    command_step shuttle "ci/docker-run-default-image.sh ci/test-shuttle.sh" 10
   else
     annotate --style info \
-      "Stable-perf skipped as no relevant files were modified"
+      "test-shuttle skipped as no relevant files were modified"
   fi
 
   # Downstream backwards compatibility
@@ -243,21 +260,15 @@ EOF
              ^ci/test-local-cluster.sh \
              ^core/build.rs \
              ^fetch-perf-libs.sh \
+             ^platform-tools-sdk/ \
              ^programs/ \
              ^sdk/ \
-             ^scripts/build-downstream-projects.sh \
-             cargo-build-bpf$ \
-             cargo-test-bpf$ \
              cargo-build-sbf$ \
              cargo-test-sbf$ \
+             ^ci/downstream-projects \
+             .buildkite/scripts/build-downstream-projects.sh \
       ; then
-    cat >> "$output_file" <<"EOF"
-  - command: "scripts/build-downstream-projects.sh"
-    name: "downstream-projects"
-    timeout_in_minutes: 35
-    agents:
-      queue: "solana"
-EOF
+    .buildkite/scripts/build-downstream-projects.sh >> "$output_file"
   else
     annotate --style info \
       "downstream-projects skipped as no relevant files were modified"
@@ -269,42 +280,26 @@ EOF
              ^ci/test-stable.sh \
              ^sdk/ \
       ; then
-    command_step wasm ". ci/rust-version.sh; ci/docker-run.sh \$\$rust_stable_docker_image ci/test-wasm.sh" 20
+    command_step wasm "ci/docker-run-default-image.sh ci/test-wasm.sh" 20
   else
     annotate --style info \
       "wasm skipped as no relevant files were modified"
   fi
 
-  # Benches...
+  # Coverage...
   if affects \
              .rs$ \
              Cargo.lock$ \
              Cargo.toml$ \
              ^ci/rust-version.sh \
              ^ci/test-coverage.sh \
-             ^ci/test-bench.sh \
+             ^scripts/coverage.sh \
       ; then
-    command_step bench "ci/test-bench.sh" 40
+    command_step coverage "ci/docker-run-default-image.sh ci/test-coverage.sh" 80
   else
-    annotate --style info --context test-bench \
-      "Bench skipped as no .rs files were modified"
+    annotate --style info --context test-coverage \
+      "Coverage skipped as no .rs files were modified"
   fi
-
-  command_step "local-cluster" \
-    ". ci/rust-version.sh; ci/docker-run.sh \$\$rust_stable_docker_image ci/test-local-cluster.sh" \
-    40
-
-  command_step "local-cluster-flakey" \
-    ". ci/rust-version.sh; ci/docker-run.sh \$\$rust_stable_docker_image ci/test-local-cluster-flakey.sh" \
-    10
-
-  command_step "local-cluster-slow-1" \
-    ". ci/rust-version.sh; ci/docker-run.sh \$\$rust_stable_docker_image ci/test-local-cluster-slow-1.sh" \
-    40
-
-  command_step "local-cluster-slow-2" \
-    ". ci/rust-version.sh; ci/docker-run.sh \$\$rust_stable_docker_image ci/test-local-cluster-slow-2.sh" \
-    40
 }
 
 pull_or_push_steps() {
@@ -312,14 +307,17 @@ pull_or_push_steps() {
   wait_step
 
   # Check for any .sh file changes
-  if affects .sh$; then
+  if affects \
+              .sh$ \
+              ^.buildkite/hooks \
+      ; then
     command_step shellcheck "ci/shellcheck.sh" 5 check
     wait_step
   fi
 
   # Version bump PRs are an edge case that can skip most of the CI steps
   if affects .toml$ && affects .lock$ && ! affects_other_than .toml$ .lock$; then
-    optional_old_version_number=$(git diff "$BUILDKITE_PULL_REQUEST_BASE_BRANCH"..HEAD validator/Cargo.toml | \
+    optional_old_version_number=$(git diff origin/"$BUILDKITE_PULL_REQUEST_BASE_BRANCH"..HEAD validator/Cargo.toml | \
       grep -e "^-version" | sed  's/-version = "\(.*\)"/\1/')
     echo "optional_old_version_number: ->$optional_old_version_number<-"
     new_version_number=$(grep -e  "^version = " validator/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
@@ -329,24 +327,24 @@ pull_or_push_steps() {
     # lines that don't match. Any diff that produces output here is not a version bump.
     # | cat is a no-op. If this pull request is a version bump then grep will output no lines and have an exit code of 1.
     # Piping the output to cat prevents that non-zero exit code from exiting this script
-    diff_other_than_version_bump=$(git diff "$BUILDKITE_PULL_REQUEST_BASE_BRANCH"..HEAD | \
+    diff_other_than_version_bump=$(git diff origin/"$BUILDKITE_PULL_REQUEST_BASE_BRANCH"..HEAD | \
       grep -vE "^ |^@@ |^--- |^\+\+\+ |^index |^diff |^-( \")?solana.*$optional_old_version_number|^\+( \")?solana.*$new_version_number|^-version|^\+version"|cat)
     echo "diff_other_than_version_bump: ->$diff_other_than_version_bump<-"
 
     if [ -z "$diff_other_than_version_bump" ]; then
       echo "Diff only contains version bump."
-      command_step checks ". ci/rust-version.sh; ci/docker-run.sh \$\$rust_nightly_docker_image ci/test-checks.sh" 20
+      command_step checks "ci/docker-run-default-image.sh ci/test-checks.sh" 20
       exit 0
     fi
   fi
 
   # Run the full test suite by default, skipping only if modifications are local
   # to some particular areas of the tree
-  if affects_other_than ^.buildkite ^.mergify .md$ ^docs/ ^.gitbook; then
+  if affects_other_than ^.mergify .md$ ^docs/ ^.gitbook; then
     all_test_steps
   fi
 
-  # docs changes run on Travis or Github actions...
+  # docs changes run on Github actions...
 }
 
 
@@ -354,7 +352,7 @@ if [[ -n $BUILDKITE_TAG ]]; then
   start_pipeline "Tag pipeline for $BUILDKITE_TAG"
 
   annotate --style info --context release-tag \
-    "https://github.com/solana-labs/solana/releases/$BUILDKITE_TAG"
+    "https://github.com/anza-xyz/agave/releases/$BUILDKITE_TAG"
 
   # Jump directly to the secondary build to publish release artifacts quickly
   trigger_secondary_step
@@ -372,12 +370,8 @@ if [[ $BUILDKITE_BRANCH =~ ^pull ]]; then
 
   # Add helpful link back to the corresponding Github Pull Request
   annotate --style info --context pr-backlink \
-    "Github Pull Request: https://github.com/solana-labs/solana/$BUILDKITE_BRANCH"
+    "Github Pull Request: https://github.com/anza-xyz/agave/$BUILDKITE_BRANCH"
 
-  if [[ $GITHUB_USER = "dependabot[bot]" ]]; then
-    command_step dependabot "ci/dependabot-pr.sh" 5
-    wait_step
-  fi
   pull_or_push_steps
   exit 0
 fi

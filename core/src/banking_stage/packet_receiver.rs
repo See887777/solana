@@ -1,13 +1,12 @@
 use {
-    super::BankingStageStats,
-    crate::{
-        banking_trace::BankingPacketReceiver,
+    super::{
         immutable_deserialized_packet::ImmutableDeserializedPacket,
-        leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker,
+        leader_slot_metrics::LeaderSlotMetricsTracker,
         packet_deserializer::{PacketDeserializer, ReceivePacketResults},
-        tracer_packet_stats::TracerPacketStats,
         unprocessed_transaction_storage::UnprocessedTransactionStorage,
+        BankingStageStats,
     },
+    agave_banking_stage_ingress_types::BankingPacketReceiver,
     crossbeam_channel::RecvTimeoutError,
     solana_measure::{measure::Measure, measure_us},
     solana_sdk::{saturating_add_assign, timing::timestamp},
@@ -32,7 +31,6 @@ impl PacketReceiver {
         &mut self,
         unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
         banking_stage_stats: &mut BankingStageStats,
-        tracer_packet_stats: &mut TracerPacketStats,
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
     ) -> Result<(), RecvTimeoutError> {
         let (result, recv_time_us) = measure_us!({
@@ -42,6 +40,11 @@ impl PacketReceiver {
                 .receive_packets(
                     recv_timeout,
                     unprocessed_transaction_storage.max_receive_size(),
+                    |packet| {
+                        packet.check_insufficent_compute_unit_limit()?;
+                        packet.check_excessive_precompiles()?;
+                        Ok(packet)
+                    },
                 )
                 // Consumes results if Ok, otherwise we keep the Err
                 .map(|receive_packet_results| {
@@ -49,7 +52,6 @@ impl PacketReceiver {
                         receive_packet_results,
                         unprocessed_transaction_storage,
                         banking_stage_stats,
-                        tracer_packet_stats,
                         slot_metrics_tracker,
                     );
                     recv_and_buffer_measure.stop();
@@ -69,8 +71,11 @@ impl PacketReceiver {
     fn get_receive_timeout(
         unprocessed_transaction_storage: &UnprocessedTransactionStorage,
     ) -> Duration {
-        // Gossip thread will almost always not wait because the transaction storage will most likely not be empty
-        if !unprocessed_transaction_storage.is_empty() {
+        // Gossip thread (does not process) should not continuously receive with 0 duration.
+        // This can cause the thread to run at 100% CPU because it is continuously polling.
+        if !unprocessed_transaction_storage.should_not_process()
+            && !unprocessed_transaction_storage.is_empty()
+        {
             // If there are buffered packets, run the equivalent of try_recv to try reading more
             // packets. This prevents starving BankingStage::consume_buffered_packets due to
             // buffered_packet_batches containing transactions that exceed the cost model for
@@ -86,36 +91,28 @@ impl PacketReceiver {
         &self,
         ReceivePacketResults {
             deserialized_packets,
-            new_tracer_stats_option,
-            passed_sigverify_count,
-            failed_sigverify_count,
+            packet_stats,
         }: ReceivePacketResults,
         unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
         banking_stage_stats: &mut BankingStageStats,
-        tracer_packet_stats: &mut TracerPacketStats,
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
     ) {
         let packet_count = deserialized_packets.len();
         debug!("@{:?} txs: {} id: {}", timestamp(), packet_count, self.id);
 
-        if let Some(new_sigverify_stats) = &new_tracer_stats_option {
-            tracer_packet_stats.aggregate_sigverify_tracer_packet_stats(new_sigverify_stats);
-        }
-
-        // Track all the packets incoming from sigverify, both valid and invalid
-        slot_metrics_tracker.increment_total_new_valid_packets(passed_sigverify_count);
-        slot_metrics_tracker.increment_newly_failed_sigverify_count(failed_sigverify_count);
+        slot_metrics_tracker.increment_received_packet_counts(packet_stats);
 
         let mut dropped_packets_count = 0;
         let mut newly_buffered_packets_count = 0;
+        let mut newly_buffered_forwarded_packets_count = 0;
         Self::push_unprocessed(
             unprocessed_transaction_storage,
             deserialized_packets,
             &mut dropped_packets_count,
             &mut newly_buffered_packets_count,
+            &mut newly_buffered_forwarded_packets_count,
             banking_stage_stats,
             slot_metrics_tracker,
-            tracer_packet_stats,
         );
 
         banking_stage_stats
@@ -137,9 +134,9 @@ impl PacketReceiver {
         deserialized_packets: Vec<ImmutableDeserializedPacket>,
         dropped_packets_count: &mut usize,
         newly_buffered_packets_count: &mut usize,
+        newly_buffered_forwarded_packets_count: &mut usize,
         banking_stage_stats: &mut BankingStageStats,
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
-        tracer_packet_stats: &mut TracerPacketStats,
     ) {
         if !deserialized_packets.is_empty() {
             let _ = banking_stage_stats
@@ -147,6 +144,10 @@ impl PacketReceiver {
                 .increment(deserialized_packets.len() as u64);
 
             *newly_buffered_packets_count += deserialized_packets.len();
+            *newly_buffered_forwarded_packets_count += deserialized_packets
+                .iter()
+                .filter(|p| p.original_packet().meta().forwarded())
+                .count();
             slot_metrics_tracker
                 .increment_newly_buffered_packets_count(deserialized_packets.len() as u64);
 
@@ -157,9 +158,6 @@ impl PacketReceiver {
             saturating_add_assign!(
                 *dropped_packets_count,
                 insert_packet_batches_summary.total_dropped_packets()
-            );
-            tracer_packet_stats.increment_total_exceeded_banking_stage_buffer(
-                insert_packet_batches_summary.dropped_tracer_packets(),
             );
         }
     }

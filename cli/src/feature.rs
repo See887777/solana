@@ -1,27 +1,40 @@
 use {
     crate::{
-        cli::{CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult},
+        cli::{
+            log_instruction_custom_error, CliCommand, CliCommandInfo, CliConfig, CliError,
+            ProcessResult,
+        },
         spend_utils::{resolve_spend_tx_and_check_account_balance, SpendAmount},
     },
-    clap::{App, AppSettings, Arg, ArgMatches, SubCommand},
+    clap::{value_t_or_exit, App, AppSettings, Arg, ArgMatches, SubCommand},
     console::style,
     serde::{Deserialize, Serialize},
-    solana_clap_utils::{fee_payer::*, input_parsers::*, input_validators::*, keypair::*},
+    solana_account::Account,
+    solana_clap_utils::{
+        compute_budget::ComputeUnitLimit, fee_payer::*, hidden_unless_forced, input_parsers::*,
+        input_validators::*, keypair::*,
+    },
     solana_cli_output::{cli_version::CliVersion, QuietDisplay, VerboseDisplay},
+    solana_clock::{Epoch, Slot},
+    solana_cluster_type::ClusterType,
+    solana_epoch_schedule::EpochSchedule,
+    solana_feature_gate_client::{
+        errors::SolanaFeatureGateError, instructions::RevokePendingActivation,
+    },
+    solana_feature_gate_interface::{activate_with_lamports, from_account, Feature},
+    solana_feature_set::FEATURE_NAMES,
+    solana_message::Message,
+    solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_rpc_client_api::{client_error::Error as ClientError, request::MAX_MULTIPLE_ACCOUNTS},
-    solana_sdk::{
-        account::Account,
-        clock::Slot,
-        epoch_schedule::EpochSchedule,
-        feature::{self, Feature},
-        feature_set::FEATURE_NAMES,
-        message::Message,
-        pubkey::Pubkey,
-        transaction::Transaction,
+    solana_rpc_client_api::{
+        client_error::Error as ClientError, request::MAX_MULTIPLE_ACCOUNTS,
+        response::RpcVoteAccountInfo,
     },
-    std::{cmp::Ordering, collections::HashMap, fmt, str::FromStr, sync::Arc},
+    solana_sdk_ids::{incinerator, system_program},
+    solana_system_interface::error::SystemError,
+    solana_transaction::Transaction,
+    std::{cmp::Ordering, collections::HashMap, fmt, rc::Rc, str::FromStr},
 };
 
 const DEFAULT_MAX_ACTIVE_DISPLAY_AGE_SLOTS: Slot = 15_000_000; // ~90days
@@ -41,7 +54,13 @@ pub enum FeatureCliCommand {
     },
     Activate {
         feature: Pubkey,
+        cluster: ClusterType,
         force: ForceActivation,
+        fee_payer: SignerIndex,
+    },
+    Revoke {
+        feature: Pubkey,
+        cluster: ClusterType,
         fee_payer: SignerIndex,
     },
 }
@@ -136,7 +155,11 @@ impl fmt::Display for CliFeatures {
                     CliFeatureStatus::Inactive => style("inactive".to_string()).red(),
                     CliFeatureStatus::Pending => {
                         let current_epoch = self.epoch_schedule.get_epoch(self.current_slot);
-                        style(format!("pending until epoch {}", current_epoch + 1)).yellow()
+                        style(format!(
+                            "pending until epoch {}",
+                            current_epoch.saturating_add(1)
+                        ))
+                        .yellow()
                     }
                     CliFeatureStatus::Active(activation_slot) => {
                         let activation_epoch = self.epoch_schedule.get_epoch(activation_slot);
@@ -231,7 +254,9 @@ impl fmt::Display for CliClusterSoftwareVersions {
             f,
             "{}",
             style(format!(
-                "{software_version_title:<max_software_version_len$}  {stake_percent_title:>max_stake_percent_len$}  {rpc_percent_title:>max_rpc_percent_len$}",
+                "{software_version_title:<max_software_version_len$}  \
+                 {stake_percent_title:>max_stake_percent_len$}  \
+                 {rpc_percent_title:>max_rpc_percent_len$}",
             ))
             .bold(),
         )?;
@@ -309,8 +334,12 @@ impl fmt::Display for CliClusterFeatureSets {
             writeln!(
                 f,
                 "\n{}",
-                style("To activate features the tool and cluster feature sets must match, select a tool version that matches the cluster")
-                    .bold())?;
+                style(
+                    "To activate features the tool and cluster feature sets must match, select a \
+                     tool version that matches the cluster"
+                )
+                .bold()
+            )?;
         } else {
             if !self.stake_allowed {
                 write!(
@@ -340,7 +369,10 @@ impl fmt::Display for CliClusterFeatureSets {
             f,
             "{}",
             style(format!(
-                "{software_versions_title:<max_software_versions_len$}  {feature_set_title:<max_feature_set_len$}  {stake_percent_title:>max_stake_percent_len$}  {rpc_percent_title:>max_rpc_percent_len$}",
+                "{software_versions_title:<max_software_versions_len$}  \
+                 {feature_set_title:<max_feature_set_len$}  \
+                 {stake_percent_title:>max_stake_percent_len$}  \
+                 {rpc_percent_title:>max_rpc_percent_len$}",
             ))
             .bold(),
         )?;
@@ -383,6 +415,25 @@ pub struct CliSoftwareVersionStats {
     rpc_percent: f32,
 }
 
+/// Check an RPC's reported genesis hash against the ClusterType's known genesis hash
+fn check_rpc_genesis_hash(
+    cluster_type: &ClusterType,
+    rpc_client: &RpcClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(genesis_hash) = cluster_type.get_genesis_hash() {
+        let rpc_genesis_hash = rpc_client.get_genesis_hash()?;
+        if rpc_genesis_hash != genesis_hash {
+            return Err(format!(
+                "The genesis hash for the specified cluster {cluster_type:?} does not match the \
+                 genesis hash reported by the specified RPC. Cluster genesis hash: \
+                 {genesis_hash}, RPC reported genesis hash: {rpc_genesis_hash}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 pub trait FeatureSubCommands {
     fn feature_subcommands(self) -> Self;
 }
@@ -422,11 +473,38 @@ impl FeatureSubCommands for App<'_, '_> {
                                 .help("The signer for the feature to activate"),
                         )
                         .arg(
+                            Arg::with_name("cluster")
+                                .value_name("CLUSTER")
+                                .possible_values(&ClusterType::STRINGS)
+                                .required(true)
+                                .help("The cluster to activate the feature on"),
+                        )
+                        .arg(
                             Arg::with_name("force")
                                 .long("yolo")
-                                .hidden(true)
+                                .hidden(hidden_unless_forced())
                                 .multiple(true)
                                 .help("Override activation sanity checks. Don't use this flag"),
+                        )
+                        .arg(fee_payer_arg()),
+                )
+                .subcommand(
+                    SubCommand::with_name("revoke")
+                        .about("Revoke a pending runtime feature")
+                        .arg(
+                            Arg::with_name("feature")
+                                .value_name("FEATURE_KEYPAIR")
+                                .validator(is_valid_signer)
+                                .index(1)
+                                .required(true)
+                                .help("The signer for the feature to revoke"),
+                        )
+                        .arg(
+                            Arg::with_name("cluster")
+                                .value_name("CLUSTER")
+                                .possible_values(&ClusterType::STRINGS)
+                                .required(true)
+                                .help("The cluster to revoke the feature on"),
                         )
                         .arg(fee_payer_arg()),
                 ),
@@ -447,10 +525,11 @@ fn known_feature(feature: &Pubkey) -> Result<(), CliError> {
 pub fn parse_feature_subcommand(
     matches: &ArgMatches<'_>,
     default_signer: &DefaultSigner,
-    wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let response = match matches.subcommand() {
         ("activate", Some(matches)) => {
+            let cluster = value_t_or_exit!(matches, "cluster", ClusterType);
             let (feature_signer, feature) = signer_of(matches, "feature", wallet_manager)?;
             let (fee_payer, fee_payer_pubkey) =
                 signer_of(matches, FEE_PAYER_ARG.name, wallet_manager)?;
@@ -474,7 +553,33 @@ pub fn parse_feature_subcommand(
             CliCommandInfo {
                 command: CliCommand::Feature(FeatureCliCommand::Activate {
                     feature,
+                    cluster,
                     force,
+                    fee_payer: signer_info.index_of(fee_payer_pubkey).unwrap(),
+                }),
+                signers: signer_info.signers,
+            }
+        }
+        ("revoke", Some(matches)) => {
+            let cluster = value_t_or_exit!(matches, "cluster", ClusterType);
+            let (feature_signer, feature) = signer_of(matches, "feature", wallet_manager)?;
+            let (fee_payer, fee_payer_pubkey) =
+                signer_of(matches, FEE_PAYER_ARG.name, wallet_manager)?;
+
+            let signer_info = default_signer.generate_unique_signers(
+                vec![fee_payer, feature_signer],
+                matches,
+                wallet_manager,
+            )?;
+
+            let feature = feature.unwrap();
+
+            known_feature(&feature)?;
+
+            CliCommandInfo {
+                command: CliCommand::Feature(FeatureCliCommand::Revoke {
+                    feature,
+                    cluster,
                     fee_payer: signer_info.index_of(fee_payer_pubkey).unwrap(),
                 }),
                 signers: signer_info.signers,
@@ -492,13 +597,10 @@ pub fn parse_feature_subcommand(
             let display_all =
                 matches.is_present("display_all") || features.len() < FEATURE_NAMES.len();
             features.sort();
-            CliCommandInfo {
-                command: CliCommand::Feature(FeatureCliCommand::Status {
-                    features,
-                    display_all,
-                }),
-                signers: vec![],
-            }
+            CliCommandInfo::without_signers(CliCommand::Feature(FeatureCliCommand::Status {
+                features,
+                display_all,
+            }))
         }
         _ => unreachable!(),
     };
@@ -517,9 +619,15 @@ pub fn process_feature_subcommand(
         } => process_status(rpc_client, config, features, *display_all),
         FeatureCliCommand::Activate {
             feature,
+            cluster,
             force,
             fee_payer,
-        } => process_activate(rpc_client, config, *feature, *force, *fee_payer),
+        } => process_activate(rpc_client, config, *feature, *cluster, *force, *fee_payer),
+        FeatureCliCommand::Revoke {
+            feature,
+            cluster,
+            fee_payer,
+        } => process_revoke(rpc_client, config, *feature, *cluster, *fee_payer),
     }
 }
 
@@ -544,7 +652,7 @@ impl ClusterInfoStats {
     fn aggregate_by_feature_set(&self) -> HashMap<u32, FeatureSetStatsEntry> {
         let mut feature_set_map = HashMap::<u32, FeatureSetStatsEntry>::new();
         for ((feature_set, software_version), stats_entry) in &self.stats_map {
-            let mut map_entry = feature_set_map.entry(*feature_set).or_default();
+            let map_entry = feature_set_map.entry(*feature_set).or_default();
             map_entry.rpc_nodes_percent += stats_entry.rpc_percent;
             map_entry.stake_percent += stats_entry.stake_percent;
             map_entry.software_versions.push(software_version.clone());
@@ -560,7 +668,7 @@ impl ClusterInfoStats {
     fn aggregate_by_software_version(&self) -> HashMap<CliVersion, ClusterInfoStatsEntry> {
         let mut software_version_map = HashMap::<CliVersion, ClusterInfoStatsEntry>::new();
         for ((_feature_set, software_version), stats_entry) in &self.stats_map {
-            let mut map_entry = software_version_map
+            let map_entry = software_version_map
                 .entry(software_version.clone())
                 .or_default();
             map_entry.rpc_percent += stats_entry.rpc_percent;
@@ -604,27 +712,36 @@ fn cluster_info_stats(rpc_client: &RpcClient) -> Result<ClusterInfoStats, Client
     let vote_stakes = vote_accounts
         .current
         .into_iter()
-        .map(|vote_account| {
-            total_active_stake += vote_account.activated_stake;
-            (vote_account.node_pubkey, vote_account.activated_stake)
-        })
+        .map(
+            |RpcVoteAccountInfo {
+                 node_pubkey,
+                 activated_stake,
+                 ..
+             }| {
+                total_active_stake = total_active_stake.saturating_add(activated_stake);
+                (node_pubkey.clone(), activated_stake)
+            },
+        )
         .collect::<HashMap<_, _>>();
 
     let mut cluster_info_stats: HashMap<(u32, CliVersion), StatsEntry> = HashMap::new();
-    let mut total_rpc_nodes = 0;
+    let mut total_rpc_nodes: u64 = 0;
     for (node_id, feature_set, is_rpc, version) in cluster_info_list {
         let feature_set = feature_set.unwrap_or(0);
-        let stats_entry = cluster_info_stats
+        let StatsEntry {
+            stake_lamports,
+            rpc_nodes_count,
+        } = cluster_info_stats
             .entry((feature_set, version))
             .or_default();
 
         if let Some(vote_stake) = vote_stakes.get(&node_id) {
-            stats_entry.stake_lamports += *vote_stake;
+            *stake_lamports = stake_lamports.saturating_add(*vote_stake);
         }
 
         if is_rpc {
-            stats_entry.rpc_nodes_count += 1;
-            total_rpc_nodes += 1;
+            *rpc_nodes_count = rpc_nodes_count.saturating_add(1);
+            total_rpc_nodes = total_rpc_nodes.saturating_add(1);
         }
     }
 
@@ -759,8 +876,8 @@ fn feature_activation_allowed(
     ))
 }
 
-fn status_from_account(account: Account) -> Option<CliFeatureStatus> {
-    feature::from_account(&account).map(|feature| match feature.activated_at {
+pub(super) fn status_from_account(account: Account) -> Option<CliFeatureStatus> {
+    from_account(&account).map(|feature| match feature.activated_at {
         None => CliFeatureStatus::Pending,
         Some(activation_slot) => CliFeatureStatus::Active(activation_slot),
     })
@@ -784,6 +901,22 @@ pub fn get_feature_is_active(
         .map(|status| matches!(status, Some(CliFeatureStatus::Active(_))))
 }
 
+pub fn get_feature_activation_epoch(
+    rpc_client: &RpcClient,
+    feature_id: &Pubkey,
+) -> Result<Option<Epoch>, ClientError> {
+    rpc_client
+        .get_feature_activation_slot(feature_id)
+        .and_then(|activation_slot: Option<Slot>| {
+            rpc_client
+                .get_epoch_schedule()
+                .map(|epoch_schedule| (activation_slot, epoch_schedule))
+        })
+        .map(|(activation_slot, epoch_schedule)| {
+            activation_slot.map(|slot| epoch_schedule.get_epoch(slot))
+        })
+}
+
 fn process_status(
     rpc_client: &RpcClient,
     config: &CliConfig,
@@ -800,8 +933,7 @@ fn process_status(
     let mut features = vec![];
     for feature_ids in feature_ids.chunks(MAX_MULTIPLE_ACCOUNTS) {
         let mut feature_chunk = rpc_client
-            .get_multiple_accounts(feature_ids)
-            .unwrap_or_default()
+            .get_multiple_accounts(feature_ids)?
             .into_iter()
             .zip(feature_ids)
             .map(|(account, feature_id)| {
@@ -853,9 +985,12 @@ fn process_activate(
     rpc_client: &RpcClient,
     config: &CliConfig,
     feature_id: Pubkey,
+    cluster: ClusterType,
     force: ForceActivation,
     fee_payer: SignerIndex,
 ) -> ProcessResult {
+    check_rpc_genesis_hash(&cluster, rpc_client)?;
+
     let fee_payer = config.signers[fee_payer];
     let account = rpc_client
         .get_multiple_accounts(&[feature_id])?
@@ -864,18 +999,24 @@ fn process_activate(
         .unwrap();
 
     if let Some(account) = account {
-        if feature::from_account(&account).is_some() {
+        if from_account(&account).is_some() {
             return Err(format!("{feature_id} has already been activated").into());
         }
     }
 
     if !feature_activation_allowed(rpc_client, false)?.0 {
         match force {
-        ForceActivation::Almost =>
-            return Err("Add force argument once more to override the sanity check to force feature activation ".into()),
-        ForceActivation::Yes => println!("FEATURE ACTIVATION FORCED"),
-        ForceActivation::No =>
-            return Err("Feature activation is not allowed at this time".into()),
+            ForceActivation::Almost => {
+                return Err(
+                    "Add force argument once more to override the sanity check to force feature \
+                     activation "
+                        .into(),
+                )
+            }
+            ForceActivation::Yes => println!("FEATURE ACTIVATION FORCED"),
+            ForceActivation::No => {
+                return Err("Feature activation is not allowed at this time".into())
+            }
         }
     }
 
@@ -888,9 +1029,10 @@ fn process_activate(
         SpendAmount::Some(rent),
         &blockhash,
         &fee_payer.pubkey(),
+        ComputeUnitLimit::Default,
         |lamports| {
             Message::new(
-                &feature::activate_with_lamports(&feature_id, &fee_payer.pubkey(), lamports),
+                &activate_with_lamports(&feature_id, &fee_payer.pubkey(), lamports),
                 Some(&fee_payer.pubkey()),
             )
         },
@@ -904,6 +1046,69 @@ fn process_activate(
         FEATURE_NAMES.get(&feature_id).unwrap(),
         feature_id
     );
-    rpc_client.send_and_confirm_transaction_with_spinner(&transaction)?;
-    Ok("".to_string())
+    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+        &transaction,
+        config.commitment,
+        config.send_transaction_config,
+    );
+    log_instruction_custom_error::<SystemError>(result, config)
+}
+
+fn process_revoke(
+    rpc_client: &RpcClient,
+    config: &CliConfig,
+    feature_id: Pubkey,
+    cluster: ClusterType,
+    fee_payer: SignerIndex,
+) -> ProcessResult {
+    check_rpc_genesis_hash(&cluster, rpc_client)?;
+
+    let fee_payer = config.signers[fee_payer];
+    let account = rpc_client.get_account(&feature_id).ok();
+
+    match account.and_then(status_from_account) {
+        Some(CliFeatureStatus::Pending) => (),
+        Some(CliFeatureStatus::Active(..)) => {
+            return Err(format!("{feature_id} has already been fully activated").into());
+        }
+        Some(CliFeatureStatus::Inactive) | None => {
+            return Err(format!("{feature_id} has not been submitted for activation").into());
+        }
+    }
+
+    let blockhash = rpc_client.get_latest_blockhash()?;
+    let (message, _) = resolve_spend_tx_and_check_account_balance(
+        rpc_client,
+        false,
+        SpendAmount::Some(0),
+        &blockhash,
+        &fee_payer.pubkey(),
+        ComputeUnitLimit::Default,
+        |_lamports| {
+            Message::new(
+                &[RevokePendingActivation {
+                    feature: feature_id,
+                    incinerator: incinerator::id(),
+                    system_program: system_program::id(),
+                }
+                .instruction()],
+                Some(&fee_payer.pubkey()),
+            )
+        },
+        config.commitment,
+    )?;
+    let mut transaction = Transaction::new_unsigned(message);
+    transaction.try_sign(&config.signers, blockhash)?;
+
+    println!(
+        "Revoking {} ({})",
+        FEATURE_NAMES.get(&feature_id).unwrap(),
+        feature_id
+    );
+    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+        &transaction,
+        config.commitment,
+        config.send_transaction_config,
+    );
+    log_instruction_custom_error::<SolanaFeatureGateError>(result, config)
 }

@@ -33,10 +33,20 @@ upload-s3-artifact() {
       )
     fi
     args+=(
-      eremite/aws-cli:2018.12.18
-      /usr/bin/s3cmd --acl-public put "$1" "$2"
+      amazon/aws-cli:2.13.11
+      s3 cp "$1" "$2" --acl public-read
     )
     set -x
     docker run "${args[@]}"
   )
+}
+
+upload-gcs-artifact() {
+  echo "--- artifact: $1 to $2"
+  docker run --rm \
+    -v "$GCS_RELEASE_BUCKET_WRITER_CREDIENTIAL:/application_default_credentials.json" \
+    -v "$PWD:/solana" \
+    -e CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=/application_default_credentials.json \
+    gcr.io/google.com/cloudsdktool/google-cloud-cli:latest \
+    gcloud storage cp "$1" "$2"
 }

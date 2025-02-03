@@ -1,10 +1,10 @@
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 extern crate byte_unit;
 
 use {
     byte_unit::Byte,
     clap::{crate_description, crate_name, Arg, ArgMatches, Command},
-    serde::{Deserialize, Serialize},
+    serde_derive::{Deserialize, Serialize},
     std::{collections::HashMap, fs, ops::Sub, path::PathBuf},
 };
 

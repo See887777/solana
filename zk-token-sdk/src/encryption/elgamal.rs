@@ -6,6 +6,7 @@
 //! A twisted ElGamal ciphertext consists of two components:
 //! - A Pedersen commitment that encodes a message to be encrypted
 //! - A "decryption handle" that binds the Pedersen opening to a specific public key
+//!
 //! In contrast to the traditional ElGamal encryption scheme, the twisted ElGamal encodes messages
 //! directly as a Pedersen commitment. Therefore, proof systems that are designed specifically for
 //! Pedersen commitments can be used on the twisted ElGamal ciphertexts.
@@ -14,10 +15,17 @@
 //! discrete log to recover the originally encrypted value.
 
 use {
-    crate::encryption::{
-        discrete_log::DiscreteLog,
-        pedersen::{Pedersen, PedersenCommitment, PedersenOpening, G, H},
+    crate::{
+        encryption::{
+            discrete_log::DiscreteLog,
+            pedersen::{
+                Pedersen, PedersenCommitment, PedersenOpening, G, H, PEDERSEN_COMMITMENT_LEN,
+            },
+        },
+        errors::ElGamalError,
+        RISTRETTO_POINT_LEN, SCALAR_LEN,
     },
+    base64::{prelude::BASE64_STANDARD, Engine},
     core::ops::{Add, Mul, Sub},
     curve25519_dalek::{
         ristretto::{CompressedRistretto, RistrettoPoint},
@@ -25,13 +33,11 @@ use {
         traits::Identity,
     },
     serde::{Deserialize, Serialize},
-    solana_sdk::{
-        instruction::Instruction,
-        message::Message,
-        pubkey::Pubkey,
-        signature::Signature,
-        signer::{Signer, SignerError},
-    },
+    solana_derivation_path::DerivationPath,
+    solana_seed_derivable::SeedDerivable,
+    solana_seed_phrase::generate_seed_from_seed_phrase_and_passphrase,
+    solana_signature::Signature,
+    solana_signer::{EncodableKey, EncodableKeypair, Signer, SignerError},
     std::convert::TryInto,
     subtle::{Choice, ConstantTimeEq},
     zeroize::Zeroize,
@@ -39,14 +45,28 @@ use {
 #[cfg(not(target_os = "solana"))]
 use {
     rand::rngs::OsRng,
-    sha3::Sha3_512,
+    sha3::{Digest, Sha3_512},
     std::{
-        fmt,
-        fs::{self, File, OpenOptions},
+        error, fmt,
         io::{Read, Write},
         path::Path,
     },
 };
+
+/// Byte length of a decrypt handle
+const DECRYPT_HANDLE_LEN: usize = RISTRETTO_POINT_LEN;
+
+/// Byte length of an ElGamal ciphertext
+const ELGAMAL_CIPHERTEXT_LEN: usize = PEDERSEN_COMMITMENT_LEN + DECRYPT_HANDLE_LEN;
+
+/// Byte length of an ElGamal public key
+const ELGAMAL_PUBKEY_LEN: usize = RISTRETTO_POINT_LEN;
+
+/// Byte length of an ElGamal secret key
+const ELGAMAL_SECRET_KEY_LEN: usize = SCALAR_LEN;
+
+/// Byte length of an ElGamal keypair
+pub const ELGAMAL_KEYPAIR_LEN: usize = ELGAMAL_PUBKEY_LEN + ELGAMAL_SECRET_KEY_LEN;
 
 /// Algorithm handle for the twisted ElGamal encryption scheme
 pub struct ElGamal;
@@ -123,12 +143,12 @@ impl ElGamal {
     fn decrypt(secret: &ElGamalSecretKey, ciphertext: &ElGamalCiphertext) -> DiscreteLog {
         DiscreteLog::new(
             *G,
-            &ciphertext.commitment.0 - &(&secret.0 * &ciphertext.handle.0),
+            ciphertext.commitment.get_point() - &(&secret.0 * &ciphertext.handle.0),
         )
     }
 
     /// On input a secret key and a ciphertext, the function returns the decrypted amount
-    /// interpretted as a positive 32-bit number (but still of type `u64`).
+    /// interpreted as a positive 32-bit number (but still of type `u64`).
     ///
     /// If the originally encrypted amount is not a positive 32-bit number, then the function
     /// returns `None`.
@@ -145,30 +165,40 @@ impl ElGamal {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, Zeroize)]
 pub struct ElGamalKeypair {
     /// The public half of this keypair.
-    pub public: ElGamalPubkey,
+    public: ElGamalPubkey,
     /// The secret half of this keypair.
-    pub secret: ElGamalSecretKey,
+    secret: ElGamalSecretKey,
 }
 
 impl ElGamalKeypair {
-    /// Deterministically derives an ElGamal keypair from an Ed25519 signing key and a Solana
-    /// address.
+    /// Create an ElGamal keypair from an ElGamal public key and an ElGamal secret key.
     ///
-    /// This function exists for applications where a user may not wish to maintin a Solana
-    /// (Ed25519) keypair and an ElGamal keypair separately. A user may wish to solely maintain the
-    /// Solana keypair and then derive the ElGamal keypair on-the-fly whenever
-    /// encryption/decryption is needed.
+    /// An ElGamal keypair should never be instantiated manually; `ElGamalKeypair::new_rand` or
+    /// `ElGamalKeypair::new_from_signer` should be used instead. This function exists to create
+    /// custom ElGamal keypairs for tests.
+    pub fn new_for_tests(public: ElGamalPubkey, secret: ElGamalSecretKey) -> Self {
+        Self { public, secret }
+    }
+
+    /// Deterministically derives an ElGamal keypair from a Solana signer and a public seed.
     ///
-    /// For the spl token-2022 confidential extension application, the ElGamal encryption public
-    /// key is specified in a token account address. A natural way to derive an ElGamal keypair is
-    /// then to define it from the hash of a Solana keypair and a Solana address. However, for
-    /// general hardware wallets, the signing key is not exposed in the API. Therefore, this
-    /// function uses a signer to sign a pre-specified message with respect to a Solana address.
-    /// The resulting signature is then hashed to derive an ElGamal keypair.
+    /// This function exists for applications where a user may not wish to maintain a Solana signer
+    /// and an ElGamal keypair separately. Instead, a user can derive the ElGamal keypair
+    /// on-the-fly whenever encryption/decryption is needed.
+    ///
+    /// For the spl-token-2022 confidential extension, the ElGamal public key is specified in a
+    /// token account. A natural way to derive an ElGamal keypair is to define it from the hash of
+    /// a Solana keypair and a Solana address as the public seed. However, for general hardware
+    /// wallets, the signing key is not exposed in the API. Therefore, this function uses a signer
+    /// to sign a public seed and the resulting signature is then hashed to derive an ElGamal
+    /// keypair.
     #[cfg(not(target_os = "solana"))]
     #[allow(non_snake_case)]
-    pub fn new(signer: &dyn Signer, address: &Pubkey) -> Result<Self, SignerError> {
-        let secret = ElGamalSecretKey::new(signer, address)?;
+    pub fn new_from_signer(
+        signer: &dyn Signer,
+        public_seed: &[u8],
+    ) -> Result<Self, Box<dyn error::Error>> {
+        let secret = ElGamalSecretKey::new_from_signer(signer, public_seed)?;
         let public = ElGamalPubkey::new(&secret);
         Ok(ElGamalKeypair { public, secret })
     }
@@ -177,50 +207,57 @@ impl ElGamalKeypair {
     ///
     /// This function is randomized. It internally samples a scalar element using `OsRng`.
     #[cfg(not(target_os = "solana"))]
-    #[allow(clippy::new_ret_no_self)]
     pub fn new_rand() -> Self {
         ElGamal::keygen()
     }
 
-    pub fn to_bytes(&self) -> [u8; 64] {
-        let mut bytes = [0u8; 64];
-        bytes[..32].copy_from_slice(&self.public.to_bytes());
-        bytes[32..].copy_from_slice(self.secret.as_bytes());
+    pub fn pubkey(&self) -> &ElGamalPubkey {
+        &self.public
+    }
+
+    pub fn secret(&self) -> &ElGamalSecretKey {
+        &self.secret
+    }
+
+    #[deprecated(since = "2.0.0", note = "please use `into()` instead")]
+    #[allow(deprecated)]
+    pub fn to_bytes(&self) -> [u8; ELGAMAL_KEYPAIR_LEN] {
+        let mut bytes = [0u8; ELGAMAL_KEYPAIR_LEN];
+        bytes[..ELGAMAL_PUBKEY_LEN].copy_from_slice(&self.public.to_bytes());
+        bytes[ELGAMAL_PUBKEY_LEN..].copy_from_slice(self.secret.as_bytes());
         bytes
     }
 
+    #[deprecated(since = "2.0.0", note = "please use `try_from()` instead")]
+    #[allow(deprecated)]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 64 {
+        if bytes.len() != ELGAMAL_KEYPAIR_LEN {
             return None;
         }
 
         Some(Self {
-            public: ElGamalPubkey::from_bytes(&bytes[..32])?,
-            secret: ElGamalSecretKey::from_bytes(bytes[32..].try_into().ok()?)?,
+            public: ElGamalPubkey::from_bytes(&bytes[..ELGAMAL_PUBKEY_LEN])?,
+            secret: ElGamalSecretKey::from_bytes(bytes[ELGAMAL_PUBKEY_LEN..].try_into().ok()?)?,
         })
     }
 
     /// Reads a JSON-encoded keypair from a `Reader` implementor
-    pub fn read_json<R: Read>(reader: &mut R) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn read_json<R: Read>(reader: &mut R) -> Result<Self, Box<dyn error::Error>> {
         let bytes: Vec<u8> = serde_json::from_reader(reader)?;
-        Self::from_bytes(&bytes).ok_or_else(|| {
+        Self::try_from(bytes.as_slice()).ok().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "Invalid ElGamalKeypair").into()
         })
     }
 
     /// Reads keypair from a file
-    pub fn read_json_file<F: AsRef<Path>>(path: F) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut file = File::open(path.as_ref())?;
-        Self::read_json(&mut file)
+    pub fn read_json_file<F: AsRef<Path>>(path: F) -> Result<Self, Box<dyn error::Error>> {
+        Self::read_from_file(path)
     }
 
     /// Writes to a `Write` implementer with JSON-encoding
-    pub fn write_json<W: Write>(
-        &self,
-        writer: &mut W,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let bytes = self.to_bytes();
-        let json = serde_json::to_string(&bytes.to_vec())?;
+    pub fn write_json<W: Write>(&self, writer: &mut W) -> Result<String, Box<dyn error::Error>> {
+        let json =
+            serde_json::to_string(&Into::<[u8; ELGAMAL_KEYPAIR_LEN]>::into(self).as_slice())?;
         writer.write_all(&json.clone().into_bytes())?;
         Ok(json)
     }
@@ -230,29 +267,84 @@ impl ElGamalKeypair {
         &self,
         outfile: F,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let outfile = outfile.as_ref();
+        self.write_to_file(outfile)
+    }
+}
 
-        if let Some(outdir) = outfile.parent() {
-            fs::create_dir_all(outdir)?;
+impl EncodableKey for ElGamalKeypair {
+    fn read<R: Read>(reader: &mut R) -> Result<Self, Box<dyn error::Error>> {
+        Self::read_json(reader)
+    }
+
+    fn write<W: Write>(&self, writer: &mut W) -> Result<String, Box<dyn error::Error>> {
+        self.write_json(writer)
+    }
+}
+
+impl TryFrom<&[u8]> for ElGamalKeypair {
+    type Error = ElGamalError;
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        if bytes.len() != ELGAMAL_KEYPAIR_LEN {
+            return Err(ElGamalError::KeypairDeserialization);
         }
 
-        let mut f = {
-            #[cfg(not(unix))]
-            {
-                OpenOptions::new()
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                OpenOptions::new().mode(0o600)
-            }
-        }
-        .write(true)
-        .truncate(true)
-        .create(true)
-        .open(outfile)?;
+        Ok(Self {
+            public: ElGamalPubkey::try_from(&bytes[..ELGAMAL_PUBKEY_LEN])?,
+            secret: ElGamalSecretKey::try_from(&bytes[ELGAMAL_PUBKEY_LEN..])?,
+        })
+    }
+}
 
-        self.write_json(&mut f)
+impl From<ElGamalKeypair> for [u8; ELGAMAL_KEYPAIR_LEN] {
+    fn from(keypair: ElGamalKeypair) -> Self {
+        let mut bytes = [0u8; ELGAMAL_KEYPAIR_LEN];
+        bytes[..ELGAMAL_PUBKEY_LEN]
+            .copy_from_slice(&Into::<[u8; ELGAMAL_PUBKEY_LEN]>::into(keypair.public));
+        bytes[ELGAMAL_PUBKEY_LEN..].copy_from_slice(keypair.secret.as_bytes());
+        bytes
+    }
+}
+
+impl From<&ElGamalKeypair> for [u8; ELGAMAL_KEYPAIR_LEN] {
+    fn from(keypair: &ElGamalKeypair) -> Self {
+        let mut bytes = [0u8; ELGAMAL_KEYPAIR_LEN];
+        bytes[..ELGAMAL_PUBKEY_LEN]
+            .copy_from_slice(&Into::<[u8; ELGAMAL_PUBKEY_LEN]>::into(keypair.public));
+        bytes[ELGAMAL_PUBKEY_LEN..].copy_from_slice(keypair.secret.as_bytes());
+        bytes
+    }
+}
+
+impl SeedDerivable for ElGamalKeypair {
+    fn from_seed(seed: &[u8]) -> Result<Self, Box<dyn error::Error>> {
+        let secret = ElGamalSecretKey::from_seed(seed)?;
+        let public = ElGamalPubkey::new(&secret);
+        Ok(ElGamalKeypair { public, secret })
+    }
+
+    fn from_seed_and_derivation_path(
+        _seed: &[u8],
+        _derivation_path: Option<DerivationPath>,
+    ) -> Result<Self, Box<dyn error::Error>> {
+        Err(ElGamalError::DerivationMethodNotSupported.into())
+    }
+
+    fn from_seed_phrase_and_passphrase(
+        seed_phrase: &str,
+        passphrase: &str,
+    ) -> Result<Self, Box<dyn error::Error>> {
+        Self::from_seed(&generate_seed_from_seed_phrase_and_passphrase(
+            seed_phrase,
+            passphrase,
+        ))
+    }
+}
+
+impl EncodableKeypair for ElGamalKeypair {
+    type Pubkey = ElGamalPubkey;
+
+    fn encodable_pubkey(&self) -> Self::Pubkey {
+        self.public
     }
 }
 
@@ -264,7 +356,7 @@ impl ElGamalPubkey {
     #[allow(non_snake_case)]
     pub fn new(secret: &ElGamalSecretKey) -> Self {
         let s = &secret.0;
-        assert!(s != &Scalar::zero());
+        assert_ne!(s, &Scalar::ZERO);
 
         ElGamalPubkey(s.invert() * &(*H))
     }
@@ -273,18 +365,21 @@ impl ElGamalPubkey {
         &self.0
     }
 
-    pub fn to_bytes(&self) -> [u8; 32] {
+    #[deprecated(since = "2.0.0", note = "please use `into()` instead")]
+    pub fn to_bytes(&self) -> [u8; ELGAMAL_PUBKEY_LEN] {
         self.0.compress().to_bytes()
     }
 
+    #[deprecated(since = "2.0.0", note = "please use `try_from()` instead")]
     pub fn from_bytes(bytes: &[u8]) -> Option<ElGamalPubkey> {
-        if bytes.len() != 32 {
+        if bytes.len() != ELGAMAL_PUBKEY_LEN {
             return None;
         }
+        let Ok(compressed_ristretto) = CompressedRistretto::from_slice(bytes) else {
+            return None;
+        };
 
-        Some(ElGamalPubkey(
-            CompressedRistretto::from_slice(bytes).decompress()?,
-        ))
+        compressed_ristretto.decompress().map(ElGamalPubkey)
     }
 
     /// Encrypts an amount under the public key.
@@ -311,9 +406,60 @@ impl ElGamalPubkey {
     }
 }
 
+impl EncodableKey for ElGamalPubkey {
+    fn read<R: Read>(reader: &mut R) -> Result<Self, Box<dyn error::Error>> {
+        let bytes: Vec<u8> = serde_json::from_reader(reader)?;
+        Self::try_from(bytes.as_slice()).ok().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Invalid ElGamalPubkey").into()
+        })
+    }
+
+    fn write<W: Write>(&self, writer: &mut W) -> Result<String, Box<dyn error::Error>> {
+        let bytes = Into::<[u8; ELGAMAL_PUBKEY_LEN]>::into(*self);
+        let json = serde_json::to_string(&bytes.to_vec())?;
+        writer.write_all(&json.clone().into_bytes())?;
+        Ok(json)
+    }
+}
+
 impl fmt::Display for ElGamalPubkey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", base64::encode(self.to_bytes()))
+        write!(
+            f,
+            "{}",
+            BASE64_STANDARD.encode(Into::<[u8; ELGAMAL_PUBKEY_LEN]>::into(*self))
+        )
+    }
+}
+
+impl TryFrom<&[u8]> for ElGamalPubkey {
+    type Error = ElGamalError;
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        if bytes.len() != ELGAMAL_PUBKEY_LEN {
+            return Err(ElGamalError::PubkeyDeserialization);
+        }
+
+        let Ok(compressed_ristretto) = CompressedRistretto::from_slice(bytes) else {
+            return Err(ElGamalError::PubkeyDeserialization);
+        };
+
+        Ok(ElGamalPubkey(
+            compressed_ristretto
+                .decompress()
+                .ok_or(ElGamalError::PubkeyDeserialization)?,
+        ))
+    }
+}
+
+impl From<ElGamalPubkey> for [u8; ELGAMAL_PUBKEY_LEN] {
+    fn from(pubkey: ElGamalPubkey) -> Self {
+        pubkey.0.compress().to_bytes()
+    }
+}
+
+impl From<&ElGamalPubkey> for [u8; ELGAMAL_PUBKEY_LEN] {
+    fn from(pubkey: &ElGamalPubkey) -> Self {
+        pubkey.0.compress().to_bytes()
     }
 }
 
@@ -324,20 +470,27 @@ impl fmt::Display for ElGamalPubkey {
 #[zeroize(drop)]
 pub struct ElGamalSecretKey(Scalar);
 impl ElGamalSecretKey {
-    /// Deterministically derives an ElGamal keypair from an Ed25519 signing key and a Solana
-    /// address.
+    /// Deterministically derives an ElGamal secret key from a Solana signer and a public seed.
     ///
-    /// See `ElGamalKeypair::new` for more context on the key derivation.
-    pub fn new(signer: &dyn Signer, address: &Pubkey) -> Result<Self, SignerError> {
-        let message = Message::new(
-            &[Instruction::new_with_bytes(
-                *address,
-                b"ElGamalSecretKey",
-                vec![],
-            )],
-            Some(&signer.try_pubkey()?),
-        );
-        let signature = signer.try_sign_message(&message.serialize())?;
+    /// See `ElGamalKeypair::new_from_signer` for more context on the key derivation.
+    pub fn new_from_signer(
+        signer: &dyn Signer,
+        public_seed: &[u8],
+    ) -> Result<Self, Box<dyn error::Error>> {
+        let seed = Self::seed_from_signer(signer, public_seed)?;
+        let key = Self::from_seed(&seed)?;
+        Ok(key)
+    }
+
+    /// Derive a seed from a Solana signer used to generate an ElGamal secret key.
+    ///
+    /// The seed is derived as the hash of the signature of a public seed.
+    pub fn seed_from_signer(
+        signer: &dyn Signer,
+        public_seed: &[u8],
+    ) -> Result<Vec<u8>, SignerError> {
+        let message = [b"ElGamalSecretKey", public_seed].concat();
+        let signature = signer.try_sign_message(&message)?;
 
         // Some `Signer` implementations return the default signature, which is not suitable for
         // use as key material
@@ -345,9 +498,11 @@ impl ElGamalSecretKey {
             return Err(SignerError::Custom("Rejecting default signatures".into()));
         }
 
-        Ok(ElGamalSecretKey(Scalar::hash_from_bytes::<Sha3_512>(
-            signature.as_ref(),
-        )))
+        let mut hasher = Sha3_512::new();
+        hasher.update(signature.as_ref());
+        let result = hasher.finalize();
+
+        Ok(result.to_vec())
     }
 
     /// Randomly samples an ElGamal secret key.
@@ -355,6 +510,20 @@ impl ElGamalSecretKey {
     /// This function is randomized. It internally samples a scalar element using `OsRng`.
     pub fn new_rand() -> Self {
         ElGamalSecretKey(Scalar::random(&mut OsRng))
+    }
+
+    /// Derive an ElGamal secret key from an entropy seed.
+    pub fn from_seed(seed: &[u8]) -> Result<Self, ElGamalError> {
+        const MINIMUM_SEED_LEN: usize = ELGAMAL_SECRET_KEY_LEN;
+        const MAXIMUM_SEED_LEN: usize = 65535;
+
+        if seed.len() < MINIMUM_SEED_LEN {
+            return Err(ElGamalError::SeedLengthTooShort);
+        }
+        if seed.len() > MAXIMUM_SEED_LEN {
+            return Err(ElGamalError::SeedLengthTooLong);
+        }
+        Ok(ElGamalSecretKey(Scalar::hash_from_bytes::<Sha3_512>(seed)))
     }
 
     pub fn get_scalar(&self) -> &Scalar {
@@ -374,25 +543,96 @@ impl ElGamalSecretKey {
         ElGamal::decrypt_u32(self, ciphertext)
     }
 
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub fn as_bytes(&self) -> &[u8; ELGAMAL_SECRET_KEY_LEN] {
         self.0.as_bytes()
     }
 
-    pub fn to_bytes(&self) -> [u8; 32] {
+    #[deprecated(since = "2.0.0", note = "please use `into()` instead")]
+    pub fn to_bytes(&self) -> [u8; ELGAMAL_SECRET_KEY_LEN] {
         self.0.to_bytes()
     }
 
+    #[deprecated(since = "2.0.0", note = "please use `try_from()` instead")]
     pub fn from_bytes(bytes: &[u8]) -> Option<ElGamalSecretKey> {
         match bytes.try_into() {
-            Ok(bytes) => Scalar::from_canonical_bytes(bytes).map(ElGamalSecretKey),
+            Ok(bytes) => Scalar::from_canonical_bytes(bytes)
+                .map(ElGamalSecretKey)
+                .into(),
             _ => None,
         }
+    }
+}
+
+impl EncodableKey for ElGamalSecretKey {
+    fn read<R: Read>(reader: &mut R) -> Result<Self, Box<dyn error::Error>> {
+        let bytes: Vec<u8> = serde_json::from_reader(reader)?;
+        Self::try_from(bytes.as_slice()).ok().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Invalid ElGamalSecretKey").into()
+        })
+    }
+
+    fn write<W: Write>(&self, writer: &mut W) -> Result<String, Box<dyn error::Error>> {
+        let bytes = Into::<[u8; ELGAMAL_SECRET_KEY_LEN]>::into(self);
+        let json = serde_json::to_string(&bytes.to_vec())?;
+        writer.write_all(&json.clone().into_bytes())?;
+        Ok(json)
+    }
+}
+
+impl SeedDerivable for ElGamalSecretKey {
+    fn from_seed(seed: &[u8]) -> Result<Self, Box<dyn error::Error>> {
+        let key = Self::from_seed(seed)?;
+        Ok(key)
+    }
+
+    fn from_seed_and_derivation_path(
+        _seed: &[u8],
+        _derivation_path: Option<DerivationPath>,
+    ) -> Result<Self, Box<dyn error::Error>> {
+        Err(ElGamalError::DerivationMethodNotSupported.into())
+    }
+
+    fn from_seed_phrase_and_passphrase(
+        seed_phrase: &str,
+        passphrase: &str,
+    ) -> Result<Self, Box<dyn error::Error>> {
+        let key = Self::from_seed(&generate_seed_from_seed_phrase_and_passphrase(
+            seed_phrase,
+            passphrase,
+        ))?;
+        Ok(key)
     }
 }
 
 impl From<Scalar> for ElGamalSecretKey {
     fn from(scalar: Scalar) -> ElGamalSecretKey {
         ElGamalSecretKey(scalar)
+    }
+}
+
+impl TryFrom<&[u8]> for ElGamalSecretKey {
+    type Error = ElGamalError;
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        match bytes.try_into() {
+            Ok(bytes) => Ok(ElGamalSecretKey::from(
+                Scalar::from_canonical_bytes(bytes)
+                    .into_option()
+                    .ok_or(ElGamalError::SecretKeyDeserialization)?,
+            )),
+            _ => Err(ElGamalError::SecretKeyDeserialization),
+        }
+    }
+}
+
+impl From<ElGamalSecretKey> for [u8; ELGAMAL_SECRET_KEY_LEN] {
+    fn from(secret_key: ElGamalSecretKey) -> Self {
+        secret_key.0.to_bytes()
+    }
+}
+
+impl From<&ElGamalSecretKey> for [u8; ELGAMAL_SECRET_KEY_LEN] {
+    fn from(secret_key: &ElGamalSecretKey) -> Self {
+        secret_key.0.to_bytes()
     }
 }
 
@@ -417,7 +657,8 @@ pub struct ElGamalCiphertext {
 }
 impl ElGamalCiphertext {
     pub fn add_amount<T: Into<Scalar>>(&self, amount: T) -> Self {
-        let commitment_to_add = PedersenCommitment(amount.into() * &(*G));
+        let point = amount.into() * &(*G);
+        let commitment_to_add = PedersenCommitment::new(point);
         ElGamalCiphertext {
             commitment: &self.commitment + &commitment_to_add,
             handle: self.handle,
@@ -425,28 +666,29 @@ impl ElGamalCiphertext {
     }
 
     pub fn subtract_amount<T: Into<Scalar>>(&self, amount: T) -> Self {
-        let commitment_to_subtract = PedersenCommitment(amount.into() * &(*G));
+        let point = amount.into() * &(*G);
+        let commitment_to_subtract = PedersenCommitment::new(point);
         ElGamalCiphertext {
             commitment: &self.commitment - &commitment_to_subtract,
             handle: self.handle,
         }
     }
 
-    pub fn to_bytes(&self) -> [u8; 64] {
-        let mut bytes = [0u8; 64];
-        bytes[..32].copy_from_slice(&self.commitment.to_bytes());
-        bytes[32..].copy_from_slice(&self.handle.to_bytes());
+    pub fn to_bytes(&self) -> [u8; ELGAMAL_CIPHERTEXT_LEN] {
+        let mut bytes = [0u8; ELGAMAL_CIPHERTEXT_LEN];
+        bytes[..PEDERSEN_COMMITMENT_LEN].copy_from_slice(&self.commitment.to_bytes());
+        bytes[PEDERSEN_COMMITMENT_LEN..].copy_from_slice(&self.handle.to_bytes());
         bytes
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<ElGamalCiphertext> {
-        if bytes.len() != 64 {
+        if bytes.len() != ELGAMAL_CIPHERTEXT_LEN {
             return None;
         }
 
         Some(ElGamalCiphertext {
-            commitment: PedersenCommitment::from_bytes(&bytes[..32])?,
-            handle: DecryptHandle::from_bytes(&bytes[32..])?,
+            commitment: PedersenCommitment::from_bytes(&bytes[..PEDERSEN_COMMITMENT_LEN])?,
+            handle: DecryptHandle::from_bytes(&bytes[PEDERSEN_COMMITMENT_LEN..])?,
         })
     }
 
@@ -470,11 +712,11 @@ impl ElGamalCiphertext {
 
 impl fmt::Display for ElGamalCiphertext {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", base64::encode(self.to_bytes()))
+        write!(f, "{}", BASE64_STANDARD.encode(self.to_bytes()))
     }
 }
 
-impl<'a, 'b> Add<&'b ElGamalCiphertext> for &'a ElGamalCiphertext {
+impl<'b> Add<&'b ElGamalCiphertext> for &ElGamalCiphertext {
     type Output = ElGamalCiphertext;
 
     fn add(self, ciphertext: &'b ElGamalCiphertext) -> ElGamalCiphertext {
@@ -491,7 +733,7 @@ define_add_variants!(
     Output = ElGamalCiphertext
 );
 
-impl<'a, 'b> Sub<&'b ElGamalCiphertext> for &'a ElGamalCiphertext {
+impl<'b> Sub<&'b ElGamalCiphertext> for &ElGamalCiphertext {
     type Output = ElGamalCiphertext;
 
     fn sub(self, ciphertext: &'b ElGamalCiphertext) -> ElGamalCiphertext {
@@ -508,7 +750,7 @@ define_sub_variants!(
     Output = ElGamalCiphertext
 );
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a ElGamalCiphertext {
+impl<'b> Mul<&'b Scalar> for &ElGamalCiphertext {
     type Output = ElGamalCiphertext;
 
     fn mul(self, scalar: &'b Scalar) -> ElGamalCiphertext {
@@ -525,7 +767,7 @@ define_mul_variants!(
     Output = ElGamalCiphertext
 );
 
-impl<'a, 'b> Mul<&'b ElGamalCiphertext> for &'a Scalar {
+impl<'b> Mul<&'b ElGamalCiphertext> for &Scalar {
     type Output = ElGamalCiphertext;
 
     fn mul(self, ciphertext: &'b ElGamalCiphertext) -> ElGamalCiphertext {
@@ -547,29 +789,31 @@ define_mul_variants!(
 pub struct DecryptHandle(RistrettoPoint);
 impl DecryptHandle {
     pub fn new(public: &ElGamalPubkey, opening: &PedersenOpening) -> Self {
-        Self(&public.0 * &opening.0)
+        Self(&public.0 * opening.get_scalar())
     }
 
     pub fn get_point(&self) -> &RistrettoPoint {
         &self.0
     }
 
-    pub fn to_bytes(&self) -> [u8; 32] {
+    pub fn to_bytes(&self) -> [u8; DECRYPT_HANDLE_LEN] {
         self.0.compress().to_bytes()
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<DecryptHandle> {
-        if bytes.len() != 32 {
+        if bytes.len() != DECRYPT_HANDLE_LEN {
             return None;
         }
 
-        Some(DecryptHandle(
-            CompressedRistretto::from_slice(bytes).decompress()?,
-        ))
+        let Ok(compressed_ristretto) = CompressedRistretto::from_slice(bytes) else {
+            return None;
+        };
+
+        compressed_ristretto.decompress().map(DecryptHandle)
     }
 }
 
-impl<'a, 'b> Add<&'b DecryptHandle> for &'a DecryptHandle {
+impl<'b> Add<&'b DecryptHandle> for &DecryptHandle {
     type Output = DecryptHandle;
 
     fn add(self, handle: &'b DecryptHandle) -> DecryptHandle {
@@ -583,7 +827,7 @@ define_add_variants!(
     Output = DecryptHandle
 );
 
-impl<'a, 'b> Sub<&'b DecryptHandle> for &'a DecryptHandle {
+impl<'b> Sub<&'b DecryptHandle> for &DecryptHandle {
     type Output = DecryptHandle;
 
     fn sub(self, handle: &'b DecryptHandle) -> DecryptHandle {
@@ -597,7 +841,7 @@ define_sub_variants!(
     Output = DecryptHandle
 );
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a DecryptHandle {
+impl<'b> Mul<&'b Scalar> for &DecryptHandle {
     type Output = DecryptHandle;
 
     fn mul(self, scalar: &'b Scalar) -> DecryptHandle {
@@ -607,7 +851,7 @@ impl<'a, 'b> Mul<&'b Scalar> for &'a DecryptHandle {
 
 define_mul_variants!(LHS = DecryptHandle, RHS = Scalar, Output = DecryptHandle);
 
-impl<'a, 'b> Mul<&'b DecryptHandle> for &'a Scalar {
+impl<'b> Mul<&'b DecryptHandle> for &Scalar {
     type Output = DecryptHandle;
 
     fn mul(self, handle: &'b DecryptHandle) -> DecryptHandle {
@@ -622,7 +866,11 @@ mod tests {
     use {
         super::*,
         crate::encryption::pedersen::Pedersen,
-        solana_sdk::{signature::Keypair, signer::null_signer::NullSigner},
+        bip39::{Language, Mnemonic, MnemonicType, Seed},
+        solana_keypair::Keypair,
+        solana_pubkey::Pubkey,
+        solana_signer::null_signer::NullSigner,
+        std::fs::{self, File},
     };
 
     #[test]
@@ -637,6 +885,7 @@ mod tests {
         assert_eq!(57_u64, secret.decrypt_u32(&ciphertext).unwrap());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn test_encrypt_decrypt_correctness_multithreaded() {
         let ElGamalKeypair { public, secret } = ElGamalKeypair::new_rand();
@@ -644,7 +893,7 @@ mod tests {
         let ciphertext = ElGamal::encrypt(&public, amount);
 
         let mut instance = ElGamal::decrypt(&secret, &ciphertext);
-        instance.num_threads(4).unwrap();
+        instance.num_threads(4.try_into().unwrap()).unwrap();
         assert_eq!(57_u64, instance.decode_u32().unwrap());
     }
 
@@ -799,10 +1048,10 @@ mod tests {
         assert!(Path::new(&outfile).exists());
         assert_eq!(
             keypair_vec,
-            ElGamalKeypair::read_json_file(&outfile)
-                .unwrap()
-                .to_bytes()
-                .to_vec()
+            Into::<[u8; ELGAMAL_KEYPAIR_LEN]>::into(
+                ElGamalKeypair::read_json_file(&outfile).unwrap()
+            )
+            .to_vec()
         );
 
         #[cfg(unix)]
@@ -856,21 +1105,46 @@ mod tests {
     }
 
     #[test]
-    fn test_secret_key_new() {
+    fn test_secret_key_new_from_signer() {
         let keypair1 = Keypair::new();
         let keypair2 = Keypair::new();
 
         assert_ne!(
-            ElGamalSecretKey::new(&keypair1, &Pubkey::default())
+            ElGamalSecretKey::new_from_signer(&keypair1, Pubkey::default().as_ref())
                 .unwrap()
                 .0,
-            ElGamalSecretKey::new(&keypair2, &Pubkey::default())
+            ElGamalSecretKey::new_from_signer(&keypair2, Pubkey::default().as_ref())
                 .unwrap()
                 .0,
         );
 
         let null_signer = NullSigner::new(&Pubkey::default());
-        assert!(ElGamalSecretKey::new(&null_signer, &Pubkey::default()).is_err());
+        assert!(
+            ElGamalSecretKey::new_from_signer(&null_signer, Pubkey::default().as_ref()).is_err()
+        );
+    }
+
+    #[test]
+    fn test_keypair_from_seed() {
+        let good_seed = vec![0; 32];
+        assert!(ElGamalKeypair::from_seed(&good_seed).is_ok());
+
+        let too_short_seed = vec![0; 31];
+        assert!(ElGamalKeypair::from_seed(&too_short_seed).is_err());
+
+        let too_long_seed = vec![0; 65536];
+        assert!(ElGamalKeypair::from_seed(&too_long_seed).is_err());
+    }
+
+    #[test]
+    fn test_keypair_from_seed_phrase_and_passphrase() {
+        let mnemonic = Mnemonic::new(MnemonicType::Words12, Language::English);
+        let passphrase = "42";
+        let seed = Seed::new(&mnemonic, passphrase);
+        let expected_keypair = ElGamalKeypair::from_seed(seed.as_bytes()).unwrap();
+        let keypair =
+            ElGamalKeypair::from_seed_phrase_and_passphrase(mnemonic.phrase(), passphrase).unwrap();
+        assert_eq!(keypair.public, expected_keypair.public);
     }
 
     #[test]

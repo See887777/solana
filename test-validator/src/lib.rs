@@ -1,15 +1,27 @@
-#![allow(clippy::integer_arithmetic)]
-
+#![allow(clippy::arithmetic_side_effects)]
 use {
+    base64::{prelude::BASE64_STANDARD, Engine},
+    crossbeam_channel::Receiver,
     log::*,
+    solana_accounts_db::{
+        accounts_db::AccountsDbConfig, accounts_index::AccountsIndexConfig,
+        hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+        utils::create_accounts_run_and_snapshot_dirs,
+    },
     solana_cli_output::CliAccount,
-    solana_client::rpc_request::MAX_MULTIPLE_ACCOUNTS,
+    solana_compute_budget::compute_budget::ComputeBudget,
     solana_core::{
-        tower_storage::TowerStorage,
-        validator::{Validator, ValidatorConfig, ValidatorStartProgress},
+        admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
+        consensus::tower_storage::TowerStorage,
+        validator::{Validator, ValidatorConfig, ValidatorStartProgress, ValidatorTpuConfig},
+    },
+    solana_feature_set::FEATURE_NAMES,
+    solana_geyser_plugin_manager::{
+        geyser_plugin_manager::GeyserPluginManager, GeyserPluginManagerRequest,
     },
     solana_gossip::{
         cluster_info::{ClusterInfo, Node},
+        contact_info::Protocol,
         gossip_service::discover_cluster,
         socketaddr,
     },
@@ -18,25 +30,24 @@ use {
         create_new_tmp_ledger,
     },
     solana_net_utils::PortRange,
-    solana_program_runtime::compute_budget::ComputeBudget,
     solana_rpc::{rpc::JsonRpcConfig, rpc_pubsub_service::PubSubConfig},
     solana_rpc_client::{nonblocking, rpc_client::RpcClient},
+    solana_rpc_client_api::request::MAX_MULTIPLE_ACCOUNTS,
     solana_runtime::{
-        accounts_db::AccountsDbConfig, accounts_index::AccountsIndexConfig, bank_forks::BankForks,
-        genesis_utils::create_genesis_config_with_leader_ex,
-        hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, runtime_config::RuntimeConfig,
-        snapshot_config::SnapshotConfig, snapshot_utils::create_accounts_run_and_snapshot_dirs,
+        bank_forks::BankForks,
+        genesis_utils::{self, create_genesis_config_with_leader_ex_no_features},
+        runtime_config::RuntimeConfig,
+        snapshot_config::SnapshotConfig,
     },
     solana_sdk::{
-        account::{Account, AccountSharedData},
+        account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
         bpf_loader_upgradeable::UpgradeableLoaderState,
         clock::{Slot, DEFAULT_MS_PER_SLOT},
         commitment_config::CommitmentConfig,
         epoch_schedule::EpochSchedule,
         exit::Exit,
-        feature_set::FEATURE_NAMES,
-        fee_calculator::{FeeCalculator, FeeRateGovernor},
-        hash::Hash,
+        feature_set::FeatureSet,
+        fee_calculator::FeeRateGovernor,
         instruction::{AccountMeta, Instruction},
         message::Message,
         native_token::sol_to_lamports,
@@ -45,9 +56,7 @@ use {
         signature::{read_keypair_file, write_keypair_file, Keypair, Signer},
     },
     solana_streamer::socket::SocketAddrSpace,
-    solana_tpu_client::tpu_client::{
-        DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_TPU_ENABLE_UDP, DEFAULT_TPU_USE_QUIC,
-    },
+    solana_tpu_client::tpu_client::DEFAULT_TPU_ENABLE_UDP,
     std::{
         collections::{HashMap, HashSet},
         ffi::OsStr,
@@ -70,9 +79,10 @@ pub struct AccountInfo<'a> {
 }
 
 #[derive(Clone)]
-pub struct ProgramInfo {
+pub struct UpgradeableProgramInfo {
     pub program_id: Pubkey,
     pub loader: Pubkey,
+    pub upgrade_authority: Pubkey,
     pub program_path: PathBuf,
 }
 
@@ -108,9 +118,8 @@ pub struct TestValidatorGenesis {
     pubsub_config: PubSubConfig,
     rpc_ports: Option<(u16, u16)>, // (JsonRpc, JsonRpcPubSub), None == random ports
     warp_slot: Option<Slot>,
-    no_bpf_jit: bool,
     accounts: HashMap<Pubkey, AccountSharedData>,
-    programs: Vec<ProgramInfo>,
+    upgradeable_programs: Vec<UpgradeableProgramInfo>,
     ticks_per_slot: Option<u64>,
     epoch_schedule: Option<EpochSchedule>,
     node_config: TestValidatorNodeConfig,
@@ -126,6 +135,8 @@ pub struct TestValidatorGenesis {
     pub log_messages_bytes_limit: Option<usize>,
     pub transaction_account_lock_limit: Option<usize>,
     pub tpu_enable_udp: bool,
+    pub geyser_plugin_manager: Arc<RwLock<GeyserPluginManager>>,
+    admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
 }
 
 impl Default for TestValidatorGenesis {
@@ -139,9 +150,8 @@ impl Default for TestValidatorGenesis {
             pubsub_config: PubSubConfig::default(),
             rpc_ports: Option::<(u16, u16)>::default(),
             warp_slot: Option::<Slot>::default(),
-            no_bpf_jit: bool::default(),
             accounts: HashMap::<Pubkey, AccountSharedData>::default(),
-            programs: Vec::<ProgramInfo>::default(),
+            upgradeable_programs: Vec::<UpgradeableProgramInfo>::default(),
             ticks_per_slot: Option::<u64>::default(),
             epoch_schedule: Option::<EpochSchedule>::default(),
             node_config: TestValidatorNodeConfig::default(),
@@ -157,7 +167,46 @@ impl Default for TestValidatorGenesis {
             log_messages_bytes_limit: Option::<usize>::default(),
             transaction_account_lock_limit: Option::<usize>::default(),
             tpu_enable_udp: DEFAULT_TPU_ENABLE_UDP,
+            geyser_plugin_manager: Arc::new(RwLock::new(GeyserPluginManager::new())),
+            admin_rpc_service_post_init:
+                Arc::<RwLock<Option<AdminRpcRequestMetadataPostInit>>>::default(),
         }
+    }
+}
+
+fn try_transform_program_data(
+    address: &Pubkey,
+    account: &mut AccountSharedData,
+) -> Result<(), String> {
+    if account.owner() == &solana_sdk::bpf_loader_upgradeable::id() {
+        let programdata_offset = UpgradeableLoaderState::size_of_programdata_metadata();
+        let programdata_meta = account.data().get(0..programdata_offset).ok_or(format!(
+            "Failed to get upgradeable programdata data from {address}"
+        ))?;
+        // Ensure the account is a proper programdata account before
+        // attempting to serialize into it.
+        if let Ok(UpgradeableLoaderState::ProgramData {
+            upgrade_authority_address,
+            ..
+        }) = bincode::deserialize::<UpgradeableLoaderState>(programdata_meta)
+        {
+            // Serialize new programdata metadata into the resulting account,
+            // to overwrite the deployment slot to `0`.
+            bincode::serialize_into(
+                account.data_as_mut_slice(),
+                &UpgradeableLoaderState::ProgramData {
+                    slot: 0,
+                    upgrade_authority_address,
+                },
+            )
+            .map_err(|_| format!("Failed to write to upgradeable programdata account {address}"))
+        } else {
+            Err(format!(
+                "Failed to read upgradeable programdata account {address}"
+            ))
+        }
+    } else {
+        Err(format!("Account {address} not owned by upgradeable loader"))
     }
 }
 
@@ -234,11 +283,6 @@ impl TestValidatorGenesis {
         self
     }
 
-    pub fn bpf_jit(&mut self, bpf_jit: bool) -> &mut Self {
-        self.no_bpf_jit = !bpf_jit;
-        self
-    }
-
     pub fn gossip_host(&mut self, gossip_host: IpAddr) -> &mut Self {
         self.node_config.gossip_addr.set_ip(gossip_host);
         self
@@ -264,11 +308,6 @@ impl TestValidatorGenesis {
         self
     }
 
-    #[deprecated(note = "Please use `compute_unit_limit` instead")]
-    pub fn max_compute_units(&mut self, max_compute_units: u64) -> &mut Self {
-        self.compute_unit_limit(max_compute_units)
-    }
-
     /// Add an account to the test environment
     pub fn add_account(&mut self, address: Pubkey, account: AccountSharedData) -> &mut Self {
         self.accounts.insert(address, account);
@@ -285,14 +324,16 @@ impl TestValidatorGenesis {
         self
     }
 
-    pub fn clone_accounts<T>(
+    fn clone_accounts_and_transform<T, F>(
         &mut self,
         addresses: T,
         rpc_client: &RpcClient,
         skip_missing: bool,
+        transform: F,
     ) -> Result<&mut Self, String>
     where
         T: IntoIterator<Item = Pubkey>,
+        F: Fn(&Pubkey, Account) -> Result<AccountSharedData, String>,
     {
         let addresses: Vec<Pubkey> = addresses.into_iter().collect();
         for chunk in addresses.chunks(MAX_MULTIPLE_ACCOUNTS) {
@@ -302,7 +343,7 @@ impl TestValidatorGenesis {
                 .map_err(|err| format!("Failed to fetch: {err}"))?;
             for (address, res) in chunk.iter().zip(responses) {
                 if let Some(account) = res {
-                    self.add_account(*address, AccountSharedData::from(account));
+                    self.add_account(*address, transform(address, account)?);
                 } else if skip_missing {
                     warn!("Could not find {}, skipping.", address);
                 } else {
@@ -311,6 +352,49 @@ impl TestValidatorGenesis {
             }
         }
         Ok(self)
+    }
+
+    pub fn clone_accounts<T>(
+        &mut self,
+        addresses: T,
+        rpc_client: &RpcClient,
+        skip_missing: bool,
+    ) -> Result<&mut Self, String>
+    where
+        T: IntoIterator<Item = Pubkey>,
+    {
+        self.clone_accounts_and_transform(
+            addresses,
+            rpc_client,
+            skip_missing,
+            |address, account| {
+                let mut account_shared_data = AccountSharedData::from(account);
+                // ignore the error
+                try_transform_program_data(address, &mut account_shared_data).ok();
+                Ok(account_shared_data)
+            },
+        )
+    }
+
+    pub fn clone_programdata_accounts<T>(
+        &mut self,
+        addresses: T,
+        rpc_client: &RpcClient,
+        skip_missing: bool,
+    ) -> Result<&mut Self, String>
+    where
+        T: IntoIterator<Item = Pubkey>,
+    {
+        self.clone_accounts_and_transform(
+            addresses,
+            rpc_client,
+            skip_missing,
+            |address, account| {
+                let mut account_shared_data = AccountSharedData::from(account);
+                try_transform_program_data(address, &mut account_shared_data)?;
+                Ok(account_shared_data)
+            },
+        )
     }
 
     pub fn clone_upgradeable_programs<T>(
@@ -340,8 +424,34 @@ impl TestValidatorGenesis {
             }
         }
 
-        self.clone_accounts(programdata_addresses, rpc_client, false)?;
+        self.clone_programdata_accounts(programdata_addresses, rpc_client, false)?;
 
+        Ok(self)
+    }
+
+    pub fn clone_feature_set(&mut self, rpc_client: &RpcClient) -> Result<&mut Self, String> {
+        for feature_ids in FEATURE_NAMES
+            .keys()
+            .cloned()
+            .collect::<Vec<Pubkey>>()
+            .chunks(MAX_MULTIPLE_ACCOUNTS)
+        {
+            rpc_client
+                .get_multiple_accounts(feature_ids)
+                .map_err(|err| format!("Failed to fetch: {err}"))?
+                .into_iter()
+                .zip(feature_ids)
+                .for_each(|(maybe_account, feature_id)| {
+                    if maybe_account
+                        .as_ref()
+                        .and_then(solana_sdk::feature::from_account)
+                        .and_then(|feature| feature.activated_at)
+                        .is_none()
+                    {
+                        self.deactivate_feature_set.insert(*feature_id);
+                    }
+                });
+        }
         Ok(self)
     }
 
@@ -350,9 +460,8 @@ impl TestValidatorGenesis {
         accounts: &[AccountInfo],
     ) -> Result<&mut Self, String> {
         for account in accounts {
-            let account_path = match solana_program_test::find_file(account.filename) {
-                Some(path) => path,
-                None => return Err(format!("Unable to locate {}", account.filename)),
+            let Some(account_path) = solana_program_test::find_file(account.filename) else {
+                return Err(format!("Unable to locate {}", account.filename));
             };
             let mut file = File::open(&account_path).unwrap();
             let mut account_info_raw = String::new();
@@ -455,7 +564,8 @@ impl TestValidatorGenesis {
             address,
             AccountSharedData::from(Account {
                 lamports,
-                data: base64::decode(data_base64)
+                data: BASE64_STANDARD
+                    .decode(data_base64)
                     .unwrap_or_else(|err| panic!("Failed to base64 decode: {err}")),
                 owner,
                 executable: false,
@@ -472,19 +582,22 @@ impl TestValidatorGenesis {
         let program_path = solana_program_test::find_file(&format!("{program_name}.so"))
             .unwrap_or_else(|| panic!("Unable to locate program {program_name}"));
 
-        self.programs.push(ProgramInfo {
+        self.upgradeable_programs.push(UpgradeableProgramInfo {
             program_id,
-            loader: solana_sdk::bpf_loader::id(),
+            loader: solana_sdk::bpf_loader_upgradeable::id(),
+            upgrade_authority: Pubkey::default(),
             program_path,
         });
         self
     }
 
-    /// Add a list of programs to the test environment.
-    ///pub fn add_programs_with_path<'a>(&'a mut self, programs: &[ProgramInfo]) -> &'a mut Self {
-    pub fn add_programs_with_path(&mut self, programs: &[ProgramInfo]) -> &mut Self {
+    /// Add a list of upgradeable programs to the test environment.
+    pub fn add_upgradeable_programs_with_path(
+        &mut self,
+        programs: &[UpgradeableProgramInfo],
+    ) -> &mut Self {
         for program in programs {
-            self.programs.push(program.clone());
+            self.upgradeable_programs.push(program.clone());
         }
         self
     }
@@ -497,14 +610,32 @@ impl TestValidatorGenesis {
         mint_address: Pubkey,
         socket_addr_space: SocketAddrSpace,
     ) -> Result<TestValidator, Box<dyn std::error::Error>> {
-        TestValidator::start(mint_address, self, socket_addr_space).map(|test_validator| {
+        self.start_with_mint_address_and_geyser_plugin_rpc(mint_address, socket_addr_space, None)
+    }
+
+    /// Start a test validator with the address of the mint account that will receive tokens
+    /// created at genesis. Augments admin rpc service with dynamic geyser plugin manager if
+    /// the geyser plugin service is enabled at startup.
+    ///
+    pub fn start_with_mint_address_and_geyser_plugin_rpc(
+        &self,
+        mint_address: Pubkey,
+        socket_addr_space: SocketAddrSpace,
+        rpc_to_plugin_manager_receiver: Option<Receiver<GeyserPluginManagerRequest>>,
+    ) -> Result<TestValidator, Box<dyn std::error::Error>> {
+        TestValidator::start(
+            mint_address,
+            self,
+            socket_addr_space,
+            rpc_to_plugin_manager_receiver,
+        )
+        .inspect(|test_validator| {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_io()
                 .enable_time()
                 .build()
                 .unwrap();
             runtime.block_on(test_validator.wait_for_nonzero_fees());
-            test_validator
         })
     }
 
@@ -546,7 +677,7 @@ impl TestValidatorGenesis {
         socket_addr_space: SocketAddrSpace,
     ) -> (TestValidator, Keypair) {
         let mint_keypair = Keypair::new();
-        match TestValidator::start(mint_keypair.pubkey(), self, socket_addr_space) {
+        match TestValidator::start(mint_keypair.pubkey(), self, socket_addr_space, None) {
             Ok(test_validator) => {
                 test_validator.wait_for_nonzero_fees().await;
                 (test_validator, mint_keypair)
@@ -660,21 +791,46 @@ impl TestValidator {
         for (address, account) in solana_program_test::programs::spl_programs(&config.rent) {
             accounts.entry(address).or_insert(account);
         }
-        for program in &config.programs {
-            let data = solana_program_test::read_file(&program.program_path);
+        for upgradeable_program in &config.upgradeable_programs {
+            let data = solana_program_test::read_file(&upgradeable_program.program_path);
+            let (programdata_address, _) = Pubkey::find_program_address(
+                &[upgradeable_program.program_id.as_ref()],
+                &upgradeable_program.loader,
+            );
+            let mut program_data = bincode::serialize(&UpgradeableLoaderState::ProgramData {
+                slot: 0,
+                upgrade_authority_address: Some(upgradeable_program.upgrade_authority),
+            })
+            .unwrap();
+            program_data.extend_from_slice(&data);
             accounts.insert(
-                program.program_id,
+                programdata_address,
                 AccountSharedData::from(Account {
-                    lamports: Rent::default().minimum_balance(data.len()).min(1),
+                    lamports: Rent::default().minimum_balance(program_data.len()).max(1),
+                    data: program_data,
+                    owner: upgradeable_program.loader,
+                    executable: false,
+                    rent_epoch: 0,
+                }),
+            );
+
+            let data = bincode::serialize(&UpgradeableLoaderState::Program {
+                programdata_address,
+            })
+            .unwrap();
+            accounts.insert(
+                upgradeable_program.program_id,
+                AccountSharedData::from(Account {
+                    lamports: Rent::default().minimum_balance(data.len()).max(1),
                     data,
-                    owner: program.loader,
+                    owner: upgradeable_program.loader,
                     executable: true,
                     rent_epoch: 0,
                 }),
             );
         }
 
-        let mut genesis_config = create_genesis_config_with_leader_ex(
+        let mut genesis_config = create_genesis_config_with_leader_ex_no_features(
             mint_lamports,
             &mint_address,
             &validator_identity.pubkey(),
@@ -683,34 +839,34 @@ impl TestValidator {
             validator_stake_lamports,
             validator_identity_lamports,
             config.fee_rate_governor.clone(),
-            config.rent,
+            config.rent.clone(),
             solana_sdk::genesis_config::ClusterType::Development,
             accounts.into_iter().collect(),
         );
         genesis_config.epoch_schedule = config
             .epoch_schedule
+            .as_ref()
+            .cloned()
             .unwrap_or_else(EpochSchedule::without_warmup);
 
         if let Some(ticks_per_slot) = config.ticks_per_slot {
             genesis_config.ticks_per_slot = ticks_per_slot;
         }
 
-        // Remove features tagged to deactivate
-        for deactivate_feature_pk in &config.deactivate_feature_set {
-            if FEATURE_NAMES.contains_key(deactivate_feature_pk) {
-                match genesis_config.accounts.remove(deactivate_feature_pk) {
-                    Some(_) => info!("Feature for {:?} deactivated", deactivate_feature_pk),
-                    None => warn!(
-                        "Feature {:?} set for deactivation not found in genesis_config account list, ignored.",
-                        deactivate_feature_pk
-                    ),
-                }
+        // Only activate features which are not explicitly deactivated.
+        let mut feature_set = FeatureSet::default().inactive;
+        for feature in &config.deactivate_feature_set {
+            if feature_set.remove(feature) {
+                info!("Feature for {:?} deactivated", feature)
             } else {
                 warn!(
                     "Feature {:?} set for deactivation is not a known Feature public key",
-                    deactivate_feature_pk
-                );
+                    feature,
+                )
             }
+        }
+        for feature in feature_set {
+            genesis_utils::activate_feature(&mut genesis_config, feature);
         }
 
         let ledger_path = match &config.ledger_path {
@@ -744,6 +900,14 @@ impl TestValidator {
             ledger_path.join("validator-keypair.json").to_str().unwrap(),
         )?;
 
+        write_keypair_file(
+            &validator_stake_account,
+            ledger_path
+                .join("stake-account-keypair.json")
+                .to_str()
+                .unwrap(),
+        )?;
+
         // `ledger_exists` should fail until the vote account keypair is written
         assert!(!TestValidatorGenesis::ledger_exists(&ledger_path));
 
@@ -763,6 +927,7 @@ impl TestValidator {
         mint_address: Pubkey,
         config: &TestValidatorGenesis,
         socket_addr_space: SocketAddrSpace,
+        rpc_to_plugin_manager_receiver: Option<Receiver<GeyserPluginManagerRequest>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let preserve_ledger = config.ledger_path.is_some();
         let ledger_path = TestValidator::initialize_ledger(mint_address, config)?;
@@ -791,7 +956,7 @@ impl TestValidator {
         let vote_account_address = validator_vote_account.pubkey();
         let rpc_url = format!("http://{}", node.info.rpc().unwrap());
         let rpc_pubsub_url = format!("ws://{}/", node.info.rpc_pubsub().unwrap());
-        let tpu = node.info.tpu().unwrap();
+        let tpu = node.info.tpu(Protocol::UDP).unwrap();
         let gossip = node.info.gossip().unwrap();
 
         {
@@ -809,11 +974,11 @@ impl TestValidator {
                 started_from_validator: true,
                 ..AccountsIndexConfig::default()
             }),
+            account_indexes: Some(config.rpc_config.account_indexes.clone()),
             ..AccountsDbConfig::default()
         });
 
         let runtime_config = RuntimeConfig {
-            bpf_jit: !config.no_bpf_jit,
             compute_budget: config
                 .compute_unit_limit
                 .map(|compute_unit_limit| ComputeBudget {
@@ -825,7 +990,7 @@ impl TestValidator {
         };
 
         let mut validator_config = ValidatorConfig {
-            geyser_plugin_config_files: config.geyser_plugin_config_files.clone(),
+            on_start_geyser_plugin_config_files: config.geyser_plugin_config_files.clone(),
             rpc_addrs: Some((
                 SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -844,7 +1009,7 @@ impl TestValidator {
                     .unwrap()
                     .0,
             ],
-            poh_verify: false, // Skip PoH verification of ledger on startup for speed
+            run_verification: false, // Skip PoH verification of ledger on startup for speed
             snapshot_config: SnapshotConfig {
                 full_snapshot_archive_interval_slots: 100,
                 incremental_snapshot_archive_interval_slots: Slot::MAX,
@@ -853,7 +1018,6 @@ impl TestValidator {
                 incremental_snapshot_archives_dir: ledger_path.to_path_buf(),
                 ..SnapshotConfig::default()
             },
-            enforce_ulimit_nofile: false,
             warp_slot: config.warp_slot,
             validator_exit: config.validator_exit.clone(),
             max_ledger_shreds: config.max_ledger_shreds,
@@ -861,7 +1025,6 @@ impl TestValidator {
             staked_nodes_overrides: config.staked_nodes_overrides.clone(),
             accounts_db_config,
             runtime_config,
-            account_indexes: config.rpc_config.account_indexes.clone(),
             ..ValidatorConfig::default_for_test()
         };
         if let Some(ref tower_storage) = config.tower_storage {
@@ -877,11 +1040,11 @@ impl TestValidator {
             vec![],
             &validator_config,
             true, // should_check_duplicate_instance
+            rpc_to_plugin_manager_receiver,
             config.start_progress.clone(),
             socket_addr_space,
-            DEFAULT_TPU_USE_QUIC,
-            DEFAULT_TPU_CONNECTION_POOL_SIZE,
-            config.tpu_enable_udp,
+            ValidatorTpuConfig::new_for_tests(config.tpu_enable_udp),
+            config.admin_rpc_service_post_init.clone(),
         )?);
 
         // Needed to avoid panics in `solana-responder-gossip` in tests that create a number of
@@ -975,20 +1138,6 @@ impl TestValidator {
         self.vote_account_address
     }
 
-    /// Return an RpcClient for the validator.  As a convenience, also return a recent blockhash and
-    /// associated fee calculator
-    #[deprecated(since = "1.9.0", note = "Please use `get_rpc_client` instead")]
-    pub fn rpc_client(&self) -> (RpcClient, Hash, FeeCalculator) {
-        let rpc_client =
-            RpcClient::new_with_commitment(self.rpc_url.clone(), CommitmentConfig::processed());
-        #[allow(deprecated)]
-        let (recent_blockhash, fee_calculator) = rpc_client
-            .get_recent_blockhash()
-            .expect("get_recent_blockhash");
-
-        (rpc_client, recent_blockhash, fee_calculator)
-    }
-
     /// Return an RpcClient for the validator.
     pub fn get_rpc_client(&self) -> RpcClient {
         RpcClient::new_with_commitment(self.rpc_url.clone(), CommitmentConfig::processed())
@@ -1040,7 +1189,7 @@ impl Drop for TestValidator {
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use {super::*, solana_sdk::feature::Feature};
 
     #[test]
     fn get_health() {
@@ -1063,5 +1212,87 @@ mod test {
     async fn document_tokio_panic() {
         // `start()` blows up when run within tokio
         let (_test_validator, _payer) = TestValidatorGenesis::default().start();
+    }
+
+    #[tokio::test]
+    async fn test_deactivate_features() {
+        let mut control = FeatureSet::default().inactive;
+        let mut deactivate_features = Vec::new();
+        [
+            solana_sdk::feature_set::deprecate_rewards_sysvar::id(),
+            solana_sdk::feature_set::disable_fees_sysvar::id(),
+        ]
+        .into_iter()
+        .for_each(|feature| {
+            control.remove(&feature);
+            deactivate_features.push(feature);
+        });
+
+        // Convert to `Vec` so we can get a slice.
+        let control: Vec<Pubkey> = control.into_iter().collect();
+
+        let (test_validator, _payer) = TestValidatorGenesis::default()
+            .deactivate_features(&deactivate_features)
+            .start_async()
+            .await;
+
+        let rpc_client = test_validator.get_async_rpc_client();
+
+        // Our deactivated features should be inactive.
+        let inactive_feature_accounts = rpc_client
+            .get_multiple_accounts(&deactivate_features)
+            .await
+            .unwrap();
+        for f in inactive_feature_accounts {
+            assert!(f.is_none());
+        }
+
+        // Everything else should be active.
+        for chunk in control.chunks(100) {
+            let active_feature_accounts = rpc_client.get_multiple_accounts(chunk).await.unwrap();
+            for f in active_feature_accounts {
+                let account = f.unwrap(); // Should be `Some`.
+                let feature_state: Feature = bincode::deserialize(account.data()).unwrap();
+                assert!(feature_state.activated_at.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_override_feature_account() {
+        let with_deactivate_flag = solana_sdk::feature_set::deprecate_rewards_sysvar::id();
+        let without_deactivate_flag = solana_sdk::feature_set::disable_fees_sysvar::id();
+
+        let owner = Pubkey::new_unique();
+        let account = || AccountSharedData::new(100_000, 0, &owner);
+
+        let (test_validator, _payer) = TestValidatorGenesis::default()
+            .deactivate_features(&[with_deactivate_flag]) // Just deactivate one feature.
+            .add_accounts([
+                (with_deactivate_flag, account()), // But add both accounts.
+                (without_deactivate_flag, account()),
+            ])
+            .start_async()
+            .await;
+
+        let rpc_client = test_validator.get_async_rpc_client();
+
+        let our_accounts = rpc_client
+            .get_multiple_accounts(&[with_deactivate_flag, without_deactivate_flag])
+            .await
+            .unwrap();
+
+        // The first one, where we provided `--deactivate-feature`, should be
+        // the account we provided.
+        let overriden_account = our_accounts[0].as_ref().unwrap();
+        assert_eq!(overriden_account.lamports, 100_000);
+        assert_eq!(overriden_account.data.len(), 0);
+        assert_eq!(overriden_account.owner, owner);
+
+        // The second one should be a feature account.
+        let feature_account = our_accounts[1].as_ref().unwrap();
+        assert_eq!(feature_account.owner, solana_sdk::feature::id());
+        let feature_state: Feature = bincode::deserialize(feature_account.data()).unwrap();
+        assert!(feature_state.activated_at.is_some());
     }
 }

@@ -1,4 +1,4 @@
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 
 use {
     clap::{crate_description, crate_name, value_t, values_t_or_exit, App, Arg},
@@ -126,7 +126,7 @@ fn make_dos_message(
 ) -> Message {
     let instructions: Vec<_> = (0..num_instructions)
         .map(|_| {
-            let data = [num_program_iterations, thread_rng().gen_range(0, 255)];
+            let data = [num_program_iterations, thread_rng().gen_range(0..255)];
             Instruction::new_with_bytes(program_id, &data, account_metas.to_vec())
         })
         .collect();
@@ -238,15 +238,20 @@ fn run_transactions_dos(
         config.signers = vec![payer_keypairs[0], &program_keypair];
         config.command = CliCommand::Program(ProgramCliCommand::Deploy {
             program_location: Some(program_location),
+            fee_payer_signer_index: 0,
             program_signer_index: Some(1),
             program_pubkey: None,
             buffer_signer_index: None,
             buffer_pubkey: None,
-            allow_excessive_balance: true,
             upgrade_authority_signer_index: 0,
             is_final: true,
             max_len: None,
+            compute_unit_price: None,
+            max_sign_attempts: 5,
+            use_rpc: false,
             skip_fee_check: true, // skip_fee_check
+            auto_extend: true,
+            skip_feature_verification: true,
         });
 
         process_command(&config).expect("deploy didn't pass");
@@ -425,7 +430,7 @@ fn run_transactions_dos(
 }
 
 fn main() {
-    solana_logger::setup_with_default("solana=info");
+    solana_logger::setup_with_default_filter();
     let matches = App::new(crate_name!())
         .about(crate_description!())
         .version(solana_version::version!())
@@ -513,7 +518,7 @@ fn main() {
                 .long("batch-sleep-ms")
                 .takes_value(true)
                 .value_name("NUM")
-                .help("Sleep for this long the num outstanding transctions is greater than the batch size."),
+                .help("Sleep for this long the num outstanding transactions is greater than the batch size."),
         )
         .arg(
             Arg::with_name("check_gossip")
@@ -606,7 +611,7 @@ fn main() {
         });
 
         info!("done found {} nodes", gossip_nodes.len());
-        gossip_nodes[0].rpc
+        gossip_nodes[0].rpc().unwrap()
     } else {
         info!("Using {:?} as the RPC address", entrypoint_addr);
         entrypoint_addr
@@ -679,7 +684,7 @@ pub mod test {
         let validator_config = ValidatorConfig::default_for_test();
         let num_nodes = 1;
         let mut config = ClusterConfig {
-            cluster_lamports: 10_000_000,
+            mint_lamports: 10_000_000,
             poh_config: PohConfig::new_sleep(Duration::from_millis(50)),
             node_stakes: vec![100; num_nodes],
             validator_configs: make_identical_validator_configs(&validator_config, num_nodes),

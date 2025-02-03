@@ -1,4 +1,4 @@
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 use {
     solana_entry::entry::Entry,
     solana_ledger::shred::{
@@ -16,12 +16,14 @@ use {
         convert::TryInto,
         sync::Arc,
     },
+    test_case::test_case,
 };
 
 type IndexShredsMap = BTreeMap<u32, Vec<Shred>>;
 
-#[test]
-fn test_multi_fec_block_coding() {
+#[test_case(false)]
+#[test_case(true)]
+fn test_multi_fec_block_coding(is_last_in_slot: bool) {
     let keypair = Arc::new(Keypair::new());
     let slot = 0x1234_5678_9abc_def0;
     let shredder = Shredder::new(slot, slot - 5, 0, 0).unwrap();
@@ -52,7 +54,8 @@ fn test_multi_fec_block_coding() {
     let (data_shreds, coding_shreds) = shredder.entries_to_shreds(
         &keypair,
         &entries,
-        true,  // is_last_in_slot
+        is_last_in_slot,
+        None,  // chained_merkle_root
         0,     // next_shred_index
         0,     // next_code_index
         false, // merkle_variant
@@ -106,7 +109,10 @@ fn test_multi_fec_block_coding() {
         all_shreds.extend(shred_info.into_iter().take(DATA_SHREDS_PER_FEC_BLOCK));
     }
 
-    let result = Shredder::deshred(&all_shreds[..]).unwrap();
+    let result = {
+        let shreds = all_shreds.iter().map(Shred::payload);
+        Shredder::deshred(shreds).unwrap()
+    };
     assert_eq!(serialized_entries[..], result[..serialized_entries.len()]);
 }
 
@@ -164,9 +170,7 @@ fn sort_data_coding_into_fec_sets(
         // Make sure there are no duplicates for same key
         assert!(!data_slot_and_index.contains(&key));
         data_slot_and_index.insert(key);
-        let fec_entry = fec_data
-            .entry(shred.fec_set_index())
-            .or_insert_with(Vec::new);
+        let fec_entry = fec_data.entry(shred.fec_set_index()).or_default();
         fec_entry.push(shred);
     }
     for shred in coding_shreds {
@@ -175,9 +179,7 @@ fn sort_data_coding_into_fec_sets(
         // Make sure there are no duplicates for same key
         assert!(!coding_slot_and_index.contains(&key));
         coding_slot_and_index.insert(key);
-        let fec_entry = fec_coding
-            .entry(shred.fec_set_index())
-            .or_insert_with(Vec::new);
+        let fec_entry = fec_coding.entry(shred.fec_set_index()).or_default();
         fec_entry.push(shred);
     }
 }
@@ -230,6 +232,7 @@ fn setup_different_sized_fec_blocks(
             &keypair,
             &entries,
             is_last,
+            None, // chained_merkle_root
             next_shred_index,
             next_code_index,
             false, // merkle_variant

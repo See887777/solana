@@ -1,20 +1,19 @@
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 use {
     bincode::serialized_size,
     log::*,
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
     serial_test::serial,
     solana_gossip::{
-        cluster_info,
         cluster_info_metrics::GossipStats,
+        contact_info::ContactInfo,
         crds::GossipRoute,
+        crds_data::CrdsData,
         crds_gossip::*,
         crds_gossip_error::CrdsGossipError,
-        crds_gossip_pull::{ProcessPullStats, CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS},
+        crds_gossip_pull::{CrdsTimeouts, ProcessPullStats, CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS},
         crds_gossip_push::CRDS_GOSSIP_PUSH_MSG_TIMEOUT_MS,
-        crds_value::{CrdsData, CrdsValue, CrdsValueLabel},
-        legacy_contact_info::LegacyContactInfo as ContactInfo,
-        ping_pong::PingCache,
+        crds_value::{CrdsValue, CrdsValueLabel},
     },
     solana_rayon_threadlimit::get_thread_count,
     solana_sdk::{
@@ -26,11 +25,14 @@ use {
     solana_streamer::socket::SocketAddrSpace,
     std::{
         collections::{HashMap, HashSet},
+        net::Ipv4Addr,
         ops::Deref,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     },
 };
+
+type PingCache = solana_gossip::ping_pong::PingCache<32>;
 
 #[derive(Clone)]
 struct Node {
@@ -96,14 +98,21 @@ fn stakes(network: &Network) -> HashMap<Pubkey, u64> {
 }
 
 fn star_network_create(num: usize) -> Network {
+    let gossip_port_offset = 9000;
     let node_keypair = Arc::new(Keypair::new());
     let contact_info = ContactInfo::new_localhost(&node_keypair.pubkey(), 0);
-    let entry = CrdsValue::new_unsigned(CrdsData::LegacyContactInfo(contact_info.clone()));
+    let entry = CrdsValue::new(CrdsData::from(&contact_info), &node_keypair);
     let mut network: HashMap<_, _> = (1..num)
-        .map(|_| {
+        .map(|k| {
             let node_keypair = Arc::new(Keypair::new());
-            let contact_info = ContactInfo::new_localhost(&node_keypair.pubkey(), 0);
-            let new = CrdsValue::new_unsigned(CrdsData::LegacyContactInfo(contact_info.clone()));
+            // Need unique gossip addresses, otherwise nodes will be deduped by
+            // crds_gossip::dedup_gossip_addresses before peer sampling.
+            let mut contact_info = ContactInfo::new_localhost(&node_keypair.pubkey(), 0);
+            let gossip_port = gossip_port_offset + u16::try_from(k).unwrap();
+            contact_info
+                .set_gossip((Ipv4Addr::LOCALHOST, gossip_port))
+                .unwrap();
+            let new = CrdsValue::new(CrdsData::from(&contact_info), &node_keypair);
             let node = CrdsGossip::default();
             {
                 let mut node_crds = node.crds.write().unwrap();
@@ -133,7 +142,7 @@ fn star_network_create(num: usize) -> Network {
 fn rstar_network_create(num: usize) -> Network {
     let node_keypair = Arc::new(Keypair::new());
     let contact_info = ContactInfo::new_localhost(&node_keypair.pubkey(), 0);
-    let entry = CrdsValue::new_unsigned(CrdsData::LegacyContactInfo(contact_info.clone()));
+    let entry = CrdsValue::new(CrdsData::from(&contact_info), &node_keypair);
     let origin = CrdsGossip::default();
     let id = entry.label().pubkey();
     origin
@@ -146,7 +155,7 @@ fn rstar_network_create(num: usize) -> Network {
         .map(|_| {
             let node_keypair = Arc::new(Keypair::new());
             let contact_info = ContactInfo::new_localhost(&node_keypair.pubkey(), 0);
-            let new = CrdsValue::new_unsigned(CrdsData::LegacyContactInfo(contact_info.clone()));
+            let new = CrdsValue::new(CrdsData::from(&contact_info), &node_keypair);
             let node = CrdsGossip::default();
             node.crds
                 .write()
@@ -173,7 +182,7 @@ fn ring_network_create(num: usize) -> Network {
         .map(|_| {
             let node_keypair = Arc::new(Keypair::new());
             let contact_info = ContactInfo::new_localhost(&node_keypair.pubkey(), 0);
-            let new = CrdsValue::new_unsigned(CrdsData::LegacyContactInfo(contact_info.clone()));
+            let new = CrdsValue::new(CrdsData::from(&contact_info), &node_keypair);
             let node = CrdsGossip::default();
             node.crds
                 .write()
@@ -189,7 +198,7 @@ fn ring_network_create(num: usize) -> Network {
         let start_info = {
             let start = &network[&keys[k]];
             let start_id = keys[k];
-            let label = CrdsValueLabel::LegacyContactInfo(start_id);
+            let label = CrdsValueLabel::ContactInfo(start_id);
             let gossip_crds = start.gossip.crds.read().unwrap();
             gossip_crds.get::<&CrdsValue>(&label).unwrap().clone()
         };
@@ -208,7 +217,7 @@ fn connected_staked_network_create(stakes: &[u64]) -> Network {
         .map(|n| {
             let node_keypair = Arc::new(Keypair::new());
             let contact_info = ContactInfo::new_localhost(&node_keypair.pubkey(), 0);
-            let new = CrdsValue::new_unsigned(CrdsData::LegacyContactInfo(contact_info.clone()));
+            let new = CrdsValue::new(CrdsData::from(&contact_info), &node_keypair);
             let node = CrdsGossip::default();
             node.crds
                 .write()
@@ -225,7 +234,7 @@ fn connected_staked_network_create(stakes: &[u64]) -> Network {
         .iter()
         .map(|k| {
             let start = &network[k];
-            let start_label = CrdsValueLabel::LegacyContactInfo(*k);
+            let start_label = CrdsValueLabel::ContactInfo(*k);
             let gossip_crds = start.gossip.crds.read().unwrap();
             gossip_crds.get::<&CrdsValue>(&start_label).unwrap().clone()
         })
@@ -244,8 +253,26 @@ fn connected_staked_network_create(stakes: &[u64]) -> Network {
     Network::new(network)
 }
 
-fn network_simulator_pull_only(thread_pool: &ThreadPool, network: &mut Network) {
+fn network_simulator_pull_only(thread_pool: &ThreadPool, network: &Network) {
     let num = network.len();
+    // In absence of gossip push messages, a pull only network with star
+    // topology will not converge because it forms a DAG. We add additional
+    // edges so that there is a directed path between every two pair of nodes.
+    let (pubkeys, mut entries): (Vec<_>, Vec<_>) = network
+        .nodes
+        .iter()
+        .map(|(&pubkey, node)| {
+            let label = CrdsValueLabel::ContactInfo(pubkey);
+            let crds = node.gossip.crds.read().unwrap();
+            let entry = crds.get::<&CrdsValue>(&label).unwrap().clone();
+            (pubkey, entry)
+        })
+        .unzip();
+    entries.rotate_right(1);
+    for (pubkey, entry) in pubkeys.into_iter().zip(entries) {
+        let mut crds = network.nodes[&pubkey].gossip.crds.write().unwrap();
+        let _ = crds.insert(entry, timestamp(), GossipRoute::LocalMessage);
+    }
     let (converged, bytes_tx) = network_run_pull(thread_pool, network, 0, num * 2, 0.9);
     trace!(
         "network_simulator_pull_{}: converged: {} total_bytes: {}",
@@ -288,11 +315,11 @@ fn network_simulator(thread_pool: &ThreadPool, network: &mut Network, max_conver
                 let node_crds = node.gossip.crds.read().unwrap();
                 node_crds.get::<&ContactInfo>(node_pubkey).cloned().unwrap()
             };
-            m.wallclock = now;
+            m.set_wallclock(now);
             node.gossip.process_push_message(
                 vec![(
                     Pubkey::default(),
-                    vec![CrdsValue::new_unsigned(CrdsData::LegacyContactInfo(m))],
+                    vec![CrdsValue::new(CrdsData::ContactInfo(m), &Keypair::new())],
                 )],
                 now,
             );
@@ -345,16 +372,24 @@ fn network_run_push(
                 let node_pubkey = node.keypair.pubkey();
                 let timeouts = node.gossip.make_timeouts(
                     node_pubkey,
-                    &HashMap::default(), // stakes
+                    &stakes,
                     Duration::from_millis(node.gossip.pull.crds_timeout),
                 );
                 node.gossip.purge(&node_pubkey, thread_pool, now, &timeouts);
-                (
-                    node_pubkey,
-                    node.gossip
-                        .new_push_messages(&node_pubkey, vec![], now, &stakes)
-                        .0,
-                )
+                let (entries, messages, _) = node.gossip.new_push_messages(
+                    &node_pubkey,
+                    now,
+                    &stakes,
+                    |_| true, // should_retain_crds_value
+                );
+                let messages = messages
+                    .into_iter()
+                    .map(|(pubkey, indices)| {
+                        let values = indices.into_iter().map(|k| entries[k].clone()).collect();
+                        (pubkey, values)
+                    })
+                    .collect::<Vec<(_, Vec<_>)>>();
+                (node_pubkey, messages)
             })
             .collect();
         let transfered: Vec<_> = requests
@@ -365,7 +400,11 @@ fn network_run_push(
                 let mut num_msgs: usize = 0;
                 let mut pruned: HashSet<(Pubkey, Pubkey)> = HashSet::new();
                 for (to, msgs) in push_messages {
-                    bytes += serialized_size(&msgs).unwrap() as usize;
+                    // 8 bytes for encoding the length of the vector.
+                    bytes += 8 + msgs
+                        .iter()
+                        .map(CrdsValue::bincode_serialized_size)
+                        .sum::<usize>();
                     num_msgs += 1;
                     let origins: HashSet<_> = network
                         .get(&to)
@@ -466,7 +505,7 @@ fn network_run_push(
 
 fn network_run_pull(
     thread_pool: &ThreadPool,
-    network: &mut Network,
+    network: &Network,
     start: usize,
     end: usize,
     max_convergance: f64,
@@ -477,15 +516,14 @@ fn network_run_pull(
     let mut convergance = 0f64;
     let num = network.len();
     let network_values: Vec<Node> = network.values().cloned().collect();
-    let mut timeouts = HashMap::new();
-    timeouts.insert(Pubkey::default(), CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS);
+    let stakes = stakes(network);
     for node in &network_values {
         let mut ping_cache = node.ping_cache.lock().unwrap();
         for other in &network_values {
             if node.keypair.pubkey() != other.keypair.pubkey() {
                 ping_cache.mock_pong(
                     other.keypair.pubkey(),
-                    other.contact_info.gossip,
+                    other.contact_info.gossip().unwrap(),
                     Instant::now(),
                 );
             }
@@ -507,19 +545,19 @@ fn network_run_pull(
                             now,
                             None,
                             &HashMap::new(),
-                            cluster_info::MAX_BLOOM_SIZE,
+                            992, // max_bloom_filter_bytes
                             from.ping_cache.deref(),
                             &mut pings,
                             &SocketAddrSpace::Unspecified,
                         )
                         .unwrap_or_default();
                     let from_pubkey = from.keypair.pubkey();
-                    let label = CrdsValueLabel::LegacyContactInfo(from_pubkey);
+                    let label = CrdsValueLabel::ContactInfo(from_pubkey);
                     let gossip_crds = from.gossip.crds.read().unwrap();
                     let self_info = gossip_crds.get::<&CrdsValue>(&label).unwrap().clone();
                     requests
                         .into_iter()
-                        .map(move |(peer, filters)| (peer.id, filters, self_info.clone()))
+                        .map(move |(peer, filters)| (*peer.pubkey(), filters, self_info.clone()))
                 })
                 .collect()
         };
@@ -535,7 +573,7 @@ fn network_run_pull(
                     .iter()
                     .map(|f| f.filter.bits.len() as usize / 8)
                     .sum::<usize>();
-                bytes += serialized_size(&caller_info).unwrap() as usize;
+                bytes += caller_info.bincode_serialized_size();
                 let filters: Vec<_> = filters
                     .into_iter()
                     .map(|f| (caller_info.clone(), f))
@@ -543,34 +581,38 @@ fn network_run_pull(
                 let rsp: Vec<_> = network
                     .get(&to)
                     .map(|node| {
-                        let rsp = node
-                            .gossip
+                        node.gossip
                             .generate_pull_responses(
                                 thread_pool,
                                 &filters,
                                 usize::MAX, // output_size_limit
                                 now,
+                                |_| true, // should_retain_crds_value
                                 &GossipStats::default(),
                             )
                             .into_iter()
                             .flatten()
-                            .collect();
-                        node.gossip.process_pull_requests(
-                            filters.into_iter().map(|(caller, _)| caller),
-                            now,
-                        );
-                        rsp
+                            .collect()
                     })
                     .unwrap();
-                bytes += serialized_size(&rsp).unwrap() as usize;
+                // 8 bytes for encoding the length of the vector.
+                bytes += 8 + rsp
+                    .iter()
+                    .map(CrdsValue::bincode_serialized_size)
+                    .sum::<usize>();
                 msgs += rsp.len();
                 if let Some(node) = network.get(&from) {
                     let mut stats = ProcessPullStats::default();
+                    let timeouts = CrdsTimeouts::new(
+                        node.keypair.pubkey(),
+                        CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS, // default_timeout
+                        Duration::from_secs(48 * 3600),   // epoch_duration
+                        &stakes,
+                    );
                     let (vers, vers_expired_timeout, failed_inserts) = node
                         .gossip
                         .filter_pull_responses(&timeouts, rsp, now, &mut stats);
                     node.gossip.process_pull_responses(
-                        &from,
                         vers,
                         vers_expired_timeout,
                         failed_inserts,
@@ -620,6 +662,8 @@ fn build_gossip_thread_pool() -> ThreadPool {
 
 fn new_ping_cache() -> Mutex<PingCache> {
     let ping_cache = PingCache::new(
+        &mut rand::thread_rng(),
+        Instant::now(),
         Duration::from_secs(20 * 60),      // ttl
         Duration::from_secs(20 * 60) / 64, // rate_limit_delay
         2048,                              // capacity
@@ -630,16 +674,16 @@ fn new_ping_cache() -> Mutex<PingCache> {
 #[test]
 #[serial]
 fn test_star_network_pull_50() {
-    let mut network = star_network_create(50);
+    let network = star_network_create(50);
     let thread_pool = build_gossip_thread_pool();
-    network_simulator_pull_only(&thread_pool, &mut network);
+    network_simulator_pull_only(&thread_pool, &network);
 }
 #[test]
 #[serial]
 fn test_star_network_pull_100() {
-    let mut network = star_network_create(100);
+    let network = star_network_create(100);
     let thread_pool = build_gossip_thread_pool();
-    network_simulator_pull_only(&thread_pool, &mut network);
+    network_simulator_pull_only(&thread_pool, &network);
 }
 #[test]
 #[serial]
@@ -699,9 +743,9 @@ fn test_connected_staked_network() {
 #[ignore]
 fn test_star_network_large_pull() {
     solana_logger::setup();
-    let mut network = star_network_create(2000);
+    let network = star_network_create(2000);
     let thread_pool = build_gossip_thread_pool();
-    network_simulator_pull_only(&thread_pool, &mut network);
+    network_simulator_pull_only(&thread_pool, &network);
 }
 #[test]
 #[ignore]
@@ -739,7 +783,7 @@ fn test_prune_errors() {
         .write()
         .unwrap()
         .insert(
-            CrdsValue::new_unsigned(CrdsData::LegacyContactInfo(ci.clone())),
+            CrdsValue::new(CrdsData::from(&ci), &Keypair::new()),
             0,
             GossipRoute::LocalMessage,
         )
@@ -759,7 +803,7 @@ fn test_prune_errors() {
     //incorrect dest
     let mut res = crds_gossip.process_prune_msg(
         &id,                                      // self_pubkey
-        &ci.id,                                   // peer
+        ci.pubkey(),                              // peer
         &Pubkey::from(hash(&[1; 32]).to_bytes()), // destination
         &[prune_pubkey],                          // origins
         now,
@@ -770,7 +814,7 @@ fn test_prune_errors() {
     //correct dest
     res = crds_gossip.process_prune_msg(
         &id,             // self_pubkey
-        &ci.id,          // peer
+        ci.pubkey(),     // peer
         &id,             // destination
         &[prune_pubkey], // origins
         now,
@@ -782,7 +826,7 @@ fn test_prune_errors() {
     let timeout = now + crds_gossip.push.prune_timeout * 2;
     res = crds_gossip.process_prune_msg(
         &id,             // self_pubkey
-        &ci.id,          // peer
+        ci.pubkey(),     // peer
         &id,             // destination
         &[prune_pubkey], // origins
         now,

@@ -2,11 +2,19 @@ pub use crate::nonblocking::tpu_client::TpuSenderError;
 use {
     crate::nonblocking::tpu_client::TpuClient as NonblockingTpuClient,
     rayon::iter::{IntoParallelIterator, ParallelIterator},
-    solana_connection_cache::connection_cache::{
-        ConnectionCache, ConnectionManager, ConnectionPool, NewConnectionConfig,
+    solana_client_traits::AsyncClient,
+    solana_clock::Slot,
+    solana_connection_cache::{
+        client_connection::ClientConnection,
+        connection_cache::{
+            ConnectionCache, ConnectionManager, ConnectionPool, NewConnectionConfig,
+        },
     },
+    solana_net_utils::bind_to_unspecified,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{clock::Slot, transaction::Transaction, transport::Result as TransportResult},
+    solana_signature::Signature,
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
+    solana_transaction_error::TransportResult,
     std::{
         collections::VecDeque,
         net::UdpSocket,
@@ -15,13 +23,18 @@ use {
 };
 #[cfg(feature = "spinner")]
 use {
-    solana_sdk::{message::Message, signers::Signers, transaction::TransactionError},
-    tokio::time::Duration,
+    solana_message::Message, solana_signer::signers::Signers,
+    solana_transaction_error::TransactionError, tokio::time::Duration,
 };
 
 pub const DEFAULT_TPU_ENABLE_UDP: bool = false;
 pub const DEFAULT_TPU_USE_QUIC: bool = true;
-pub const DEFAULT_TPU_CONNECTION_POOL_SIZE: usize = 4;
+pub const DEFAULT_VOTE_USE_QUIC: bool = false;
+
+/// The default connection count is set to 1 -- it should
+/// be sufficient for most use cases. Validators can use
+/// --tpu-connection-pool-size to override this default value.
+pub const DEFAULT_TPU_CONNECTION_POOL_SIZE: usize = 1;
 
 pub type Result<T> = std::result::Result<T, TpuSenderError>;
 
@@ -91,6 +104,32 @@ where
         self.invoke(self.tpu_client.try_send_transaction(transaction))
     }
 
+    /// Serialize and send transaction to the current and upcoming leader TPUs according to fanout
+    /// NOTE: send_wire_transaction() and try_send_transaction() above both fail in a specific case when used in LocalCluster
+    /// They both invoke the nonblocking TPUClient and both fail when calling "transfer_with_client()" multiple times
+    /// I do not full understand WHY the nonblocking TPUClient fails in this specific case. But the method defined below
+    /// does work although it has only been tested in LocalCluster integration tests
+    pub fn send_transaction_to_upcoming_leaders(
+        &self,
+        transaction: &Transaction,
+    ) -> TransportResult<()> {
+        let wire_transaction =
+            bincode::serialize(&transaction).expect("should serialize transaction");
+
+        let leaders = self
+            .tpu_client
+            .get_leader_tpu_service()
+            .unique_leader_tpu_sockets(self.tpu_client.get_fanout_slots());
+
+        for tpu_address in &leaders {
+            let cache = self.tpu_client.get_connection_cache();
+            let conn = cache.get_connection(tpu_address);
+            conn.send_data_async(wire_transaction.clone())?;
+        }
+
+        Ok(())
+    }
+
     /// Serialize and send a batch of transactions to the current and upcoming leader TPUs according
     /// to fanout size
     /// Returns the last error if all sends fail
@@ -111,14 +150,26 @@ where
         self.invoke(self.tpu_client.try_send_wire_transaction(wire_transaction))
     }
 
+    pub fn try_send_wire_transaction_batch(
+        &self,
+        wire_transactions: Vec<Vec<u8>>,
+    ) -> TransportResult<()> {
+        self.invoke(
+            self.tpu_client
+                .try_send_wire_transaction_batch(wire_transactions),
+        )
+    }
+
     /// Create a new client that disconnects when dropped
     pub fn new(
+        name: &'static str,
         rpc_client: Arc<RpcClient>,
         websocket_url: &str,
         config: TpuClientConfig,
         connection_manager: M,
     ) -> Result<Self> {
         let create_tpu_client = NonblockingTpuClient::new(
+            name,
             rpc_client.get_inner_client().clone(),
             websocket_url,
             config,
@@ -128,7 +179,7 @@ where
             tokio::task::block_in_place(|| rpc_client.runtime().block_on(create_tpu_client))?;
 
         Ok(Self {
-            _deprecated: UdpSocket::bind("0.0.0.0:0").unwrap(),
+            _deprecated: bind_to_unspecified().unwrap(),
             rpc_client,
             tpu_client: Arc::new(tpu_client),
         })
@@ -151,14 +202,14 @@ where
             tokio::task::block_in_place(|| rpc_client.runtime().block_on(create_tpu_client))?;
 
         Ok(Self {
-            _deprecated: UdpSocket::bind("0.0.0.0:0").unwrap(),
+            _deprecated: bind_to_unspecified().unwrap(),
             rpc_client,
             tpu_client: Arc::new(tpu_client),
         })
     }
 
     #[cfg(feature = "spinner")]
-    pub fn send_and_confirm_messages_with_spinner<T: Signers>(
+    pub fn send_and_confirm_messages_with_spinner<T: Signers + ?Sized>(
         &self,
         messages: &[Message],
         signers: &T,
@@ -178,6 +229,37 @@ where
         // `block_in_place()` only panics if called from a current_thread runtime, which is the
         // lesser evil.
         tokio::task::block_in_place(move || self.rpc_client.runtime().block_on(f))
+    }
+}
+
+// Methods below are required for calls to client.async_transfer()
+// where client is of type TpuClient<P, M, C>
+impl<P, M, C> AsyncClient for TpuClient<P, M, C>
+where
+    P: ConnectionPool<NewConnectionConfig = C>,
+    M: ConnectionManager<ConnectionPool = P, NewConnectionConfig = C>,
+    C: NewConnectionConfig,
+{
+    fn async_send_versioned_transaction(
+        &self,
+        transaction: VersionedTransaction,
+    ) -> TransportResult<Signature> {
+        let wire_transaction =
+            bincode::serialize(&transaction).expect("serialize Transaction in send_batch");
+        self.send_wire_transaction(wire_transaction);
+        Ok(transaction.signatures[0])
+    }
+
+    fn async_send_versioned_transaction_batch(
+        &self,
+        batch: Vec<VersionedTransaction>,
+    ) -> TransportResult<()> {
+        let buffers = batch
+            .into_par_iter()
+            .map(|tx| bincode::serialize(&tx).expect("serialize Transaction in send_batch"))
+            .collect::<Vec<_>>();
+        self.try_send_wire_transaction_batch(buffers)?;
+        Ok(())
     }
 }
 

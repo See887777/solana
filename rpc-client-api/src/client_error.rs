@@ -1,9 +1,8 @@
 pub use reqwest;
 use {
     crate::{request, response},
-    solana_sdk::{
-        signature::SignerError, transaction::TransactionError, transport::TransportError,
-    },
+    solana_signer::SignerError,
+    solana_transaction_error::{TransactionError, TransportError},
     std::io,
     thiserror::Error as ThisError,
 };
@@ -14,6 +13,8 @@ pub enum ErrorKind {
     Io(#[from] io::Error),
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
+    #[error("Middleware: {0}")]
+    Middleware(anyhow::Error),
     #[error(transparent)]
     RpcError(#[from] request::RpcError),
     #[error(transparent)]
@@ -64,6 +65,7 @@ impl From<ErrorKind> for TransportError {
             ErrorKind::SerdeJson(err) => Self::Custom(format!("{err:?}")),
             ErrorKind::SigningError(err) => Self::Custom(format!("{err:?}")),
             ErrorKind::Custom(err) => Self::Custom(format!("{err:?}")),
+            ErrorKind::Middleware(err) => Self::Custom(format!("{err:?}")),
         }
     }
 }
@@ -143,6 +145,19 @@ impl From<reqwest::Error> for Error {
         Self {
             request: None,
             kind: err.into(),
+        }
+    }
+}
+
+impl From<reqwest_middleware::Error> for Error {
+    fn from(err: reqwest_middleware::Error) -> Self {
+        let kind = match err {
+            reqwest_middleware::Error::Middleware(err) => ErrorKind::Middleware(err),
+            reqwest_middleware::Error::Reqwest(err) => err.into(),
+        };
+        Self {
+            request: None,
+            kind,
         }
     }
 }

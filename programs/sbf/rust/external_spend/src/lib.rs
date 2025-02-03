@@ -1,10 +1,11 @@
 //! Example Rust-based SBF program that moves a lamport from one account to another
 
+#![allow(clippy::arithmetic_side_effects)]
+
 extern crate solana_program;
 use solana_program::{account_info::AccountInfo, entrypoint::ProgramResult, pubkey::Pubkey};
 
-solana_program::entrypoint!(process_instruction);
-#[allow(clippy::unnecessary_wraps)]
+solana_program::entrypoint_no_alloc!(process_instruction);
 fn process_instruction(
     _program_id: &Pubkey,
     accounts: &[AccountInfo],

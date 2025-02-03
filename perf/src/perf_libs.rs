@@ -1,7 +1,6 @@
 use {
     core::ffi::c_void,
-    dlopen::symbor::{Container, SymBorApi, Symbol},
-    dlopen_derive::SymBorApi,
+    dlopen2::symbor::{Container, SymBorApi, Symbol},
     log::*,
     std::{
         env,
@@ -9,7 +8,7 @@ use {
         fs,
         os::raw::{c_int, c_uint},
         path::{Path, PathBuf},
-        sync::Once,
+        sync::{Once, OnceLock},
     },
 };
 
@@ -82,20 +81,16 @@ pub struct Api<'a> {
         Symbol<'a, unsafe extern "C" fn(packed_ge: *const u8) -> c_int>,
 }
 
-static mut API: Option<Container<Api>> = None;
+static API: OnceLock<Container<Api>> = OnceLock::new();
 
 fn init(name: &OsStr) {
-    static INIT_HOOK: Once = Once::new();
-
     info!("Loading {:?}", name);
-    unsafe {
-        INIT_HOOK.call_once(|| {
-            API = Some(Container::load(name).unwrap_or_else(|err| {
-                error!("Unable to load {:?}: {}", name, err);
-                std::process::exit(1);
-            }));
+    API.get_or_init(|| {
+        unsafe { Container::load(name) }.unwrap_or_else(|err| {
+            error!("Unable to load {:?}: {}", name, err);
+            std::process::exit(1);
         })
-    }
+    });
 }
 
 pub fn locate_perf_libs() -> Option<PathBuf> {
@@ -141,9 +136,11 @@ fn find_cuda_home(perf_libs_path: &Path) -> Option<PathBuf> {
     None
 }
 
-pub fn append_to_ld_library_path(path: String) {
-    let ld_library_path =
-        path + ":" + &env::var("LD_LIBRARY_PATH").unwrap_or_else(|_| "".to_string());
+pub fn append_to_ld_library_path(mut ld_library_path: String) {
+    if let Ok(env_value) = env::var("LD_LIBRARY_PATH") {
+        ld_library_path.push(':');
+        ld_library_path.push_str(&env_value);
+    }
     info!("setting ld_library_path to: {:?}", ld_library_path);
     env::set_var("LD_LIBRARY_PATH", ld_library_path);
 }
@@ -180,8 +177,8 @@ pub fn api() -> Option<&'static Container<Api<'static>>> {
             if std::env::var("TEST_PERF_LIBS_CUDA").is_ok() {
                 init_cuda();
             }
-        })
+        });
     }
 
-    unsafe { API.as_ref() }
+    API.get()
 }

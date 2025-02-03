@@ -4,21 +4,25 @@ use {
         ConnectionCache as BackendConnectionCache, ConnectionManager, ConnectionPool,
         NewConnectionConfig,
     },
+    solana_message::Message,
     solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool},
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        message::Message,
-        signers::Signers,
-        transaction::{Transaction, TransactionError},
-        transport::Result as TransportResult,
-    },
+    solana_signer::signers::Signers,
     solana_tpu_client::tpu_client::{Result, TpuClient as BackendTpuClient},
+    solana_transaction::Transaction,
+    solana_transaction_error::{TransactionError, TransportResult},
+    solana_udp_client::{UdpConfig, UdpConnectionManager, UdpPool},
     std::sync::Arc,
 };
 pub use {
     crate::nonblocking::tpu_client::TpuSenderError,
     solana_tpu_client::tpu_client::{TpuClientConfig, DEFAULT_FANOUT_SLOTS, MAX_FANOUT_SLOTS},
 };
+
+pub enum TpuClientWrapper {
+    Quic(BackendTpuClient<QuicPool, QuicConnectionManager, QuicConfig>),
+    Udp(BackendTpuClient<UdpPool, UdpConnectionManager, UdpConfig>),
+}
 
 /// Client which sends transactions directly to the current leader's TPU port over UDP.
 /// The client uses RPC to determine the current leader and fetch node contact info
@@ -76,7 +80,7 @@ impl TpuClient<QuicPool, QuicConnectionManager, QuicConfig> {
         websocket_url: &str,
         config: TpuClientConfig,
     ) -> Result<Self> {
-        let connection_cache = match ConnectionCache::default() {
+        let connection_cache = match ConnectionCache::new("connection_cache_tpu_client") {
             ConnectionCache::Quic(cache) => cache,
             ConnectionCache::Udp(_) => {
                 return Err(TpuSenderError::Custom(String::from(
@@ -111,7 +115,7 @@ where
         })
     }
 
-    pub fn send_and_confirm_messages_with_spinner<T: Signers>(
+    pub fn send_and_confirm_messages_with_spinner<T: Signers + ?Sized>(
         &self,
         messages: &[Message],
         signers: &T,

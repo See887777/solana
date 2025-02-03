@@ -13,21 +13,13 @@ source ci/rust-version.sh nightly
 eval "$(ci/channel-info.sh)"
 cargoNightly="$(readlink -f "./cargo") nightly"
 
-scripts/increment-cargo-version.sh check
-
-# Disallow uncommitted Cargo.lock changes
-(
-  _ scripts/cargo-for-all-lock-files.sh tree >/dev/null
-  set +e
-  if ! _ git diff --exit-code; then
-    cat <<EOF 1>&2
-
-Error: Uncommitted Cargo.lock changes.
-Run './scripts/cargo-for-all-lock-files.sh tree' and commit the result.
+# check that cargo-hack has been installed
+if ! $cargoNightly hack --version >/dev/null 2>&1; then
+  cat >&2 <<EOF
+ERROR: cargo hack failed.
+       install 'cargo hack' with 'cargo install cargo-hack'
 EOF
-    exit 1
-  fi
-)
+fi
 
 echo --- build environment
 (
@@ -42,19 +34,34 @@ echo --- build environment
   cargo clippy --version --verbose
   $cargoNightly clippy --version --verbose
 
+  # miri is only available with nightly
+  $cargoNightly miri --version --verbose
+
+  $cargoNightly hack --version --verbose
+
   # audit is done only with "$cargo stable"
   cargo audit --version
 
   grcov --version
+
+  sccache --version
+
+  wasm-pack --version
+
+  cargo nextest --version --verbose
+  $cargoNightly nextest --version --verbose
 )
 
 export RUST_BACKTRACE=1
 export RUSTFLAGS="-D warnings -A incomplete_features"
 
+# run cargo check for all rust files in this monorepo for faster turnaround in
+# case of any compilation/build error for nightly
+
 # Only force up-to-date lock files on edge
 if [[ $CI_BASE_BRANCH = "$EDGE_CHANNEL" ]]; then
-  # Exclude --benches as it's not available in rust stable yet
-  if _ scripts/cargo-for-all-lock-files.sh check --locked --tests --bins --examples; then
+  if _ scripts/cargo-for-all-lock-files.sh "+${rust_nightly}" check \
+    --locked --workspace --all-targets --features dummy-for-ci-check,frozen-abi; then
     true
   else
     check_status=$?
@@ -63,27 +70,29 @@ if [[ $CI_BASE_BRANCH = "$EDGE_CHANNEL" ]]; then
     echo "$0:   [tree (for outdated Cargo.lock sync)|check (for compilation error)|update -p foo --precise x.y.z (for your Cargo.toml update)] ..." >&2
     exit "$check_status"
   fi
-
-   # Ensure nightly and --benches
-  _ scripts/cargo-for-all-lock-files.sh "+${rust_nightly}" check --locked --all-targets
 else
   echo "Note: cargo-for-all-lock-files.sh skipped because $CI_BASE_BRANCH != $EDGE_CHANNEL"
 fi
 
- _ ci/order-crates-for-publishing.py
+_ ci/order-crates-for-publishing.py
 
-nightly_clippy_allows=()
+_ scripts/cargo-clippy.sh
 
-# -Z... is needed because of clippy bug: https://github.com/rust-lang/rust-clippy/issues/4612
-# run nightly clippy for `sdk/` as there's a moderate amount of nightly-only code there
- _ scripts/cargo-for-all-lock-files.sh -- "+${rust_nightly}" clippy -Zunstable-options --all-targets -- \
-   --deny=warnings \
-   --deny=clippy::integer_arithmetic \
-   "${nightly_clippy_allows[@]}"
+if [[ -n $CI ]]; then
+  # exclude from printing "Checking xxx ..."
+  _ scripts/cargo-for-all-lock-files.sh -- "+${rust_nightly}" sort --workspace --check > /dev/null
+else
+  _ scripts/cargo-for-all-lock-files.sh -- "+${rust_nightly}" sort --workspace --check
+fi
 
-_ scripts/cargo-for-all-lock-files.sh -- "+${rust_nightly}" sort --workspace --check
+_ scripts/check-dev-context-only-utils.sh tree
+
 _ scripts/cargo-for-all-lock-files.sh -- "+${rust_nightly}" fmt --all -- --check
 
- _ ci/do-audit.sh
+_ ci/do-audit.sh
+
+if [[ -n $CI ]] && [[ $CHANNEL = "stable" ]]; then
+  _ ci/check-install-all.sh
+fi
 
 echo --- ok

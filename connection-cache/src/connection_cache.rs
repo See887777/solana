@@ -4,13 +4,17 @@ use {
         connection_cache_stats::{ConnectionCacheStats, CONNECTION_STAT_SUBMISSION_INTERVAL},
         nonblocking::client_connection::ClientConnection as NonblockingClientConnection,
     },
+    crossbeam_channel::{Receiver, RecvError, Sender},
     indexmap::map::IndexMap,
+    log::*,
     rand::{thread_rng, Rng},
+    solana_keypair::Keypair,
     solana_measure::measure::Measure,
-    solana_sdk::timing::AtomicInterval,
+    solana_time_utils::AtomicInterval,
     std::{
         net::SocketAddr,
         sync::{atomic::Ordering, Arc, RwLock},
+        thread::{Builder, JoinHandle},
     },
     thiserror::Error,
 };
@@ -19,15 +23,23 @@ use {
 const MAX_CONNECTIONS: usize = 1024;
 
 /// Default connection pool size per remote address
-pub const DEFAULT_CONNECTION_POOL_SIZE: usize = 4;
+pub const DEFAULT_CONNECTION_POOL_SIZE: usize = 2;
 
-pub trait ConnectionManager {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Protocol {
+    UDP,
+    QUIC,
+}
+
+pub trait ConnectionManager: Send + Sync + 'static {
     type ConnectionPool: ConnectionPool;
     type NewConnectionConfig: NewConnectionConfig;
 
+    const PROTOCOL: Protocol;
+
     fn new_connection_pool(&self) -> Self::ConnectionPool;
     fn new_connection_config(&self) -> Self::NewConnectionConfig;
-    fn get_port_offset(&self) -> u16;
+    fn update_key(&self, _key: &Keypair) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 pub struct ConnectionCache<
@@ -35,12 +47,14 @@ pub struct ConnectionCache<
     S, // ConnectionManager
     T, // NewConnectionConfig
 > {
-    map: RwLock<IndexMap<SocketAddr, /*ConnectionPool:*/ R>>,
-    connection_manager: S,
+    name: &'static str,
+    map: Arc<RwLock<IndexMap<SocketAddr, /*ConnectionPool:*/ R>>>,
+    connection_manager: Arc<S>,
     stats: Arc<ConnectionCacheStats>,
     last_stats: AtomicInterval,
     connection_pool_size: usize,
-    connection_config: T,
+    connection_config: Arc<T>,
+    sender: Sender<(usize, SocketAddr)>,
 }
 
 impl<P, M, C> ConnectionCache<P, M, C>
@@ -49,9 +63,14 @@ where
     M: ConnectionManager<ConnectionPool = P, NewConnectionConfig = C>,
     C: NewConnectionConfig,
 {
-    pub fn new(connection_manager: M, connection_pool_size: usize) -> Result<Self, ClientError> {
+    pub fn new(
+        name: &'static str,
+        connection_manager: M,
+        connection_pool_size: usize,
+    ) -> Result<Self, ClientError> {
         let config = connection_manager.new_connection_config();
         Ok(Self::new_with_config(
+            name,
             connection_pool_size,
             config,
             connection_manager,
@@ -59,20 +78,72 @@ where
     }
 
     pub fn new_with_config(
+        name: &'static str,
         connection_pool_size: usize,
         connection_config: C,
         connection_manager: M,
     ) -> Self {
+        info!("Creating ConnectionCache {name}, pool size: {connection_pool_size}");
+        let (sender, receiver) = crossbeam_channel::unbounded();
+
+        let map = Arc::new(RwLock::new(IndexMap::with_capacity(MAX_CONNECTIONS)));
+        let config = Arc::new(connection_config);
+        let connection_manager = Arc::new(connection_manager);
+        let connection_pool_size = 1.max(connection_pool_size); // The minimum pool size is 1.
+
+        let stats = Arc::new(ConnectionCacheStats::default());
+
+        let _async_connection_thread =
+            Self::create_connection_async_thread(map.clone(), receiver, stats.clone());
         Self {
-            map: RwLock::new(IndexMap::with_capacity(MAX_CONNECTIONS)),
-            stats: Arc::new(ConnectionCacheStats::default()),
+            name,
+            map,
+            stats,
             connection_manager,
             last_stats: AtomicInterval::default(),
-            connection_pool_size: 1.max(connection_pool_size), // The minimum pool size is 1.
-            connection_config,
+            connection_pool_size,
+            connection_config: config,
+            sender,
         }
     }
 
+    /// This actually triggers the connection creation by sending empty data
+    fn create_connection_async_thread(
+        map: Arc<RwLock<IndexMap<SocketAddr, /*ConnectionPool:*/ P>>>,
+        receiver: Receiver<(usize, SocketAddr)>,
+        stats: Arc<ConnectionCacheStats>,
+    ) -> JoinHandle<()> {
+        Builder::new()
+            .name("solQAsynCon".to_string())
+            .spawn(move || loop {
+                let recv_result = receiver.recv();
+                match recv_result {
+                    Err(RecvError) => {
+                        break;
+                    }
+                    Ok((idx, addr)) => {
+                        let map = map.read().unwrap();
+                        let pool = map.get(&addr);
+                        if let Some(pool) = pool {
+                            let conn = pool.get(idx);
+                            if let Ok(conn) = conn {
+                                drop(map);
+                                let conn = conn.new_blocking_connection(addr, stats.clone());
+                                let result = conn.send_data(&[]);
+                                debug!("Create async connection result {result:?} for {addr}");
+                            }
+                        }
+                    }
+                }
+            })
+            .unwrap()
+    }
+
+    pub fn update_key(&self, key: &Keypair) -> Result<(), Box<dyn std::error::Error>> {
+        let mut map = self.map.write().unwrap();
+        map.clear();
+        self.connection_manager.update_key(key)
+    }
     /// Create a lazy connection object under the exclusive lock of the cache map if there is not
     /// enough used connections in the connection pool for the specified address.
     /// Returns CreateConnectionResult.
@@ -88,47 +159,37 @@ where
         // Read again, as it is possible that between read lock dropped and the write lock acquired
         // another thread could have setup the connection.
 
-        let should_create_connection = map
+        let pool_status = map
             .get(addr)
-            .map(|pool| pool.need_new_connection(self.connection_pool_size))
-            .unwrap_or(true);
+            .map(|pool| pool.check_pool_status(self.connection_pool_size))
+            .unwrap_or(PoolStatus::Empty);
 
-        let (cache_hit, num_evictions, eviction_timing_ms) = if should_create_connection {
-            // evict a connection if the cache is reaching upper bounds
-            let mut num_evictions = 0;
-            let mut get_connection_cache_eviction_measure =
-                Measure::start("get_connection_cache_eviction_measure");
-            let existing_index = map.get_index_of(addr);
-            while map.len() >= MAX_CONNECTIONS {
-                let mut rng = thread_rng();
-                let n = rng.gen_range(0, MAX_CONNECTIONS);
-                if let Some(index) = existing_index {
-                    if n == index {
-                        continue;
-                    }
-                }
-                map.swap_remove_index(n);
-                num_evictions += 1;
-            }
-            get_connection_cache_eviction_measure.stop();
+        let (cache_hit, num_evictions, eviction_timing_ms) =
+            if matches!(pool_status, PoolStatus::Empty) {
+                Self::create_connection_internal(
+                    &self.connection_config,
+                    &self.connection_manager,
+                    &mut map,
+                    addr,
+                    self.connection_pool_size,
+                    None,
+                )
+            } else {
+                (true, 0, 0)
+            };
 
-            map.entry(*addr)
-                .and_modify(|pool| {
-                    pool.add_connection(&self.connection_config, addr);
-                })
-                .or_insert_with(|| {
-                    let mut pool = self.connection_manager.new_connection_pool();
-                    pool.add_connection(&self.connection_config, addr);
-                    pool
-                });
-            (
-                false,
-                num_evictions,
-                get_connection_cache_eviction_measure.as_ms(),
-            )
-        } else {
-            (true, 0, 0)
-        };
+        if matches!(pool_status, PoolStatus::PartiallyFull) {
+            // trigger an async connection create
+            debug!("Triggering async connection for {addr:?}");
+            Self::create_connection_internal(
+                &self.connection_config,
+                &self.connection_manager,
+                &mut map,
+                addr,
+                self.connection_pool_size,
+                Some(&self.sender),
+            );
+        }
 
         let pool = map.get(addr).unwrap();
         let connection = pool.borrow_connection();
@@ -142,6 +203,63 @@ where
         }
     }
 
+    fn create_connection_internal(
+        config: &C,
+        connection_manager: &M,
+        map: &mut std::sync::RwLockWriteGuard<'_, IndexMap<SocketAddr, P>>,
+        addr: &SocketAddr,
+        connection_pool_size: usize,
+        async_connection_sender: Option<&Sender<(usize, SocketAddr)>>,
+    ) -> (bool, u64, u64) {
+        // evict a connection if the cache is reaching upper bounds
+        let mut num_evictions = 0;
+        let mut get_connection_cache_eviction_measure =
+            Measure::start("get_connection_cache_eviction_measure");
+        let existing_index = map.get_index_of(addr);
+        while map.len() >= MAX_CONNECTIONS {
+            let mut rng = thread_rng();
+            let n = rng.gen_range(0..MAX_CONNECTIONS);
+            if let Some(index) = existing_index {
+                if n == index {
+                    continue;
+                }
+            }
+            map.swap_remove_index(n);
+            num_evictions += 1;
+        }
+        get_connection_cache_eviction_measure.stop();
+
+        let mut hit_cache = false;
+        map.entry(*addr)
+            .and_modify(|pool| {
+                if matches!(
+                    pool.check_pool_status(connection_pool_size),
+                    PoolStatus::PartiallyFull
+                ) {
+                    let idx = pool.add_connection(config, addr);
+                    if let Some(sender) = async_connection_sender {
+                        debug!(
+                            "Sending async connection creation {} for {addr}",
+                            pool.num_connections() - 1
+                        );
+                        sender.send((idx, *addr)).unwrap();
+                    };
+                } else {
+                    hit_cache = true;
+                }
+            })
+            .or_insert_with(|| {
+                let mut pool = connection_manager.new_connection_pool();
+                pool.add_connection(config, addr);
+                pool
+            });
+        (
+            hit_cache,
+            num_evictions,
+            get_connection_cache_eviction_measure.as_ms(),
+        )
+    }
+
     fn get_or_add_connection(
         &self,
         addr: &SocketAddr,
@@ -149,14 +267,6 @@ where
         let mut get_connection_map_lock_measure = Measure::start("get_connection_map_lock_measure");
         let map = self.map.read().unwrap();
         get_connection_map_lock_measure.stop();
-
-        let port_offset = self.connection_manager.get_port_offset();
-
-        let port = addr
-            .port()
-            .checked_add(port_offset)
-            .unwrap_or_else(|| addr.port());
-        let addr = SocketAddr::new(addr.ip(), port);
 
         let mut lock_timing_ms = get_connection_map_lock_measure.as_ms();
 
@@ -171,27 +281,44 @@ where
             connection_cache_stats,
             num_evictions,
             eviction_timing_ms,
-        } = match map.get(&addr) {
+        } = match map.get(addr) {
             Some(pool) => {
-                if pool.need_new_connection(self.connection_pool_size) {
-                    // create more connection and put it in the pool
-                    drop(map);
-                    self.create_connection(&mut lock_timing_ms, &addr)
-                } else {
-                    let connection = pool.borrow_connection();
-                    CreateConnectionResult {
-                        connection,
-                        cache_hit: true,
-                        connection_cache_stats: self.stats.clone(),
-                        num_evictions: 0,
-                        eviction_timing_ms: 0,
+                let pool_status = pool.check_pool_status(self.connection_pool_size);
+                match pool_status {
+                    PoolStatus::Empty => {
+                        // create more connection and put it in the pool
+                        drop(map);
+                        self.create_connection(&mut lock_timing_ms, addr)
+                    }
+                    PoolStatus::PartiallyFull | PoolStatus::Full => {
+                        let connection = pool.borrow_connection();
+                        if matches!(pool_status, PoolStatus::PartiallyFull) {
+                            debug!("Creating connection async for {addr}");
+                            drop(map);
+                            let mut map = self.map.write().unwrap();
+                            Self::create_connection_internal(
+                                &self.connection_config,
+                                &self.connection_manager,
+                                &mut map,
+                                addr,
+                                self.connection_pool_size,
+                                Some(&self.sender),
+                            );
+                        }
+                        CreateConnectionResult {
+                            connection,
+                            cache_hit: true,
+                            connection_cache_stats: self.stats.clone(),
+                            num_evictions: 0,
+                            eviction_timing_ms: 0,
+                        }
                     }
                 }
             }
             None => {
                 // Upgrade to write access by dropping read lock and acquire write lock
                 drop(map);
-                self.create_connection(&mut lock_timing_ms, &addr)
+                self.create_connection(&mut lock_timing_ms, addr)
             }
         };
         get_connection_map_measure.stop();
@@ -228,7 +355,7 @@ where
         } = self.get_or_add_connection(addr);
 
         if report_stats {
-            connection_cache_stats.report();
+            connection_cache_stats.report(self.name);
         }
 
         if cache_hit {
@@ -286,23 +413,26 @@ pub enum ConnectionPoolError {
 
 #[derive(Error, Debug)]
 pub enum ClientError {
-    #[error("Certificate error: {0}")]
-    CertificateError(String),
-
     #[error("IO error: {0:?}")]
     IoError(#[from] std::io::Error),
 }
 
-pub trait NewConnectionConfig: Sized {
+pub trait NewConnectionConfig: Sized + Send + Sync + 'static {
     fn new() -> Result<Self, ClientError>;
 }
 
-pub trait ConnectionPool {
+pub enum PoolStatus {
+    Empty,
+    PartiallyFull,
+    Full,
+}
+
+pub trait ConnectionPool: Send + Sync + 'static {
     type NewConnectionConfig: NewConnectionConfig;
     type BaseClientConnection: BaseClientConnection;
 
-    /// Add a connection to the pool
-    fn add_connection(&mut self, config: &Self::NewConnectionConfig, addr: &SocketAddr);
+    /// Add a connection to the pool and return its index
+    fn add_connection(&mut self, config: &Self::NewConnectionConfig, addr: &SocketAddr) -> usize;
 
     /// Get the number of current connections in the pool
     fn num_connections(&self) -> usize;
@@ -314,13 +444,20 @@ pub trait ConnectionPool {
     /// This randomly picks a connection in the pool.
     fn borrow_connection(&self) -> Arc<Self::BaseClientConnection> {
         let mut rng = thread_rng();
-        let n = rng.gen_range(0, self.num_connections());
+        let n = rng.gen_range(0..self.num_connections());
         self.get(n).expect("index is within num_connections")
     }
+
     /// Check if we need to create a new connection. If the count of the connections
-    /// is smaller than the pool size.
-    fn need_new_connection(&self, required_pool_size: usize) -> bool {
-        self.num_connections() < required_pool_size
+    /// is smaller than the pool size and if there is no connection at all.
+    fn check_pool_status(&self, required_pool_size: usize) -> PoolStatus {
+        if self.num_connections() == 0 {
+            PoolStatus::Empty
+        } else if self.num_connections() < required_pool_size {
+            PoolStatus::PartiallyFull
+        } else {
+            PoolStatus::Full
+        }
     }
 
     fn create_pool_entry(
@@ -377,14 +514,13 @@ mod tests {
         async_trait::async_trait,
         rand::{Rng, SeedableRng},
         rand_chacha::ChaChaRng,
-        solana_sdk::transport::Result as TransportResult,
+        solana_net_utils::SocketConfig,
+        solana_transaction_error::TransportResult,
         std::{
             net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
             sync::Arc,
         },
     };
-
-    const MOCK_PORT_OFFSET: u16 = 42;
 
     struct MockUdpPool {
         connections: Vec<Arc<MockUdp>>,
@@ -393,9 +529,16 @@ mod tests {
         type NewConnectionConfig = MockUdpConfig;
         type BaseClientConnection = MockUdp;
 
-        fn add_connection(&mut self, config: &Self::NewConnectionConfig, addr: &SocketAddr) {
+        /// Add a connection into the pool and return its index in the pool.
+        fn add_connection(
+            &mut self,
+            config: &Self::NewConnectionConfig,
+            addr: &SocketAddr,
+        ) -> usize {
             let connection = self.create_pool_entry(config, addr);
+            let idx = self.connections.len();
             self.connections.push(connection);
+            idx
         }
 
         fn num_connections(&self) -> usize {
@@ -429,8 +572,11 @@ mod tests {
         fn default() -> Self {
             Self {
                 udp_socket: Arc::new(
-                    solana_net_utils::bind_with_any_port(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-                        .expect("Unable to bind to UDP socket"),
+                    solana_net_utils::bind_with_any_port_with_config(
+                        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        SocketConfig::default(),
+                    )
+                    .expect("Unable to bind to UDP socket"),
                 ),
             }
         }
@@ -440,8 +586,11 @@ mod tests {
         fn new() -> Result<Self, ClientError> {
             Ok(Self {
                 udp_socket: Arc::new(
-                    solana_net_utils::bind_with_any_port(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-                        .map_err(Into::<ClientError>::into)?,
+                    solana_net_utils::bind_with_any_port_with_config(
+                        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        SocketConfig::default(),
+                    )
+                    .map_err(Into::<ClientError>::into)?,
                 ),
             })
         }
@@ -487,6 +636,8 @@ mod tests {
         type ConnectionPool = MockUdpPool;
         type NewConnectionConfig = MockUdpConfig;
 
+        const PROTOCOL: Protocol = Protocol::QUIC;
+
         fn new_connection_pool(&self) -> Self::ConnectionPool {
             MockUdpPool {
                 connections: Vec::default(),
@@ -497,8 +648,8 @@ mod tests {
             MockUdpConfig::new().unwrap()
         }
 
-        fn get_port_offset(&self) -> u16 {
-            MOCK_PORT_OFFSET
+        fn update_key(&self, _key: &Keypair) -> Result<(), Box<dyn std::error::Error>> {
+            Ok(())
         }
     }
 
@@ -534,10 +685,10 @@ mod tests {
     }
 
     fn get_addr(rng: &mut ChaChaRng) -> SocketAddr {
-        let a = rng.gen_range(1, 255);
-        let b = rng.gen_range(1, 255);
-        let c = rng.gen_range(1, 255);
-        let d = rng.gen_range(1, 255);
+        let a = rng.gen_range(1..255);
+        let b = rng.gen_range(1..255);
+        let c = rng.gen_range(1..255);
+        let d = rng.gen_range(1..255);
 
         let addr_str = format!("{a}.{b}.{c}.{d}:80");
 
@@ -560,9 +711,12 @@ mod tests {
         // be lazy and not connect until first use or handle connection errors somehow
         // (without crashing, as would be required in a real practical validator)
         let connection_manager = MockConnectionManager::default();
-        let connection_cache =
-            ConnectionCache::new(connection_manager, DEFAULT_CONNECTION_POOL_SIZE).unwrap();
-        let port_offset = MOCK_PORT_OFFSET;
+        let connection_cache = ConnectionCache::new(
+            "connection_cache_test",
+            connection_manager,
+            DEFAULT_CONNECTION_POOL_SIZE,
+        )
+        .unwrap();
         let addrs = (0..MAX_CONNECTIONS)
             .map(|_| {
                 let addr = get_addr(&mut rng);
@@ -573,13 +727,7 @@ mod tests {
         {
             let map = connection_cache.map.read().unwrap();
             assert!(map.len() == MAX_CONNECTIONS);
-            addrs.iter().for_each(|a| {
-                let port = a
-                    .port()
-                    .checked_add(port_offset)
-                    .unwrap_or_else(|| a.port());
-                let addr = &SocketAddr::new(a.ip(), port);
-
+            addrs.iter().for_each(|addr| {
                 let conn = &map.get(addr).expect("Address not found").get(0).unwrap();
                 let conn = conn.new_blocking_connection(*addr, connection_cache.stats.clone());
                 assert_eq!(
@@ -596,10 +744,7 @@ mod tests {
         let addr = &get_addr(&mut rng);
         connection_cache.get_connection(addr);
 
-        let port = addr
-            .port()
-            .checked_add(port_offset)
-            .unwrap_or_else(|| addr.port());
+        let port = addr.port();
         let addr_with_quic_port = SocketAddr::new(addr.ip(), port);
         let map = connection_cache.map.read().unwrap();
         assert!(map.len() == MAX_CONNECTIONS);
@@ -611,11 +756,11 @@ mod tests {
     // an invalid port.
     #[test]
     fn test_overflow_address() {
-        let port = u16::MAX - MOCK_PORT_OFFSET + 1;
-        assert!(port.checked_add(MOCK_PORT_OFFSET).is_none());
+        let port = u16::MAX;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let connection_manager = MockConnectionManager::default();
-        let connection_cache = ConnectionCache::new(connection_manager, 1).unwrap();
+        let connection_cache =
+            ConnectionCache::new("connection_cache_test", connection_manager, 1).unwrap();
 
         let conn = connection_cache.get_connection(&addr);
         // We (intentionally) don't have an interface that allows us to distinguish between

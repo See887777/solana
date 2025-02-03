@@ -1,13 +1,13 @@
 #![allow(deprecated)]
 
 use {
-    serde::{Deserialize, Serialize},
+    serde_derive::{Deserialize, Serialize},
     solana_sdk::{
         account::Account,
         clock::Slot,
         commitment_config::CommitmentLevel,
-        fee_calculator::FeeCalculator,
         hash::Hash,
+        inner_instruction::InnerInstructions,
         message::Message,
         pubkey::Pubkey,
         signature::Signature,
@@ -37,6 +37,7 @@ pub struct TransactionSimulationDetails {
     pub logs: Vec<String>,
     pub units_consumed: u64,
     pub return_data: Option<TransactionReturnData>,
+    pub inner_instructions: Option<Vec<InnerInstructions>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,13 +63,6 @@ pub struct BanksTransactionResultWithMetadata {
 #[tarpc::service]
 pub trait Banks {
     async fn send_transaction_with_context(transaction: VersionedTransaction);
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please use `get_fee_for_message_with_commitment_and_context` instead"
-    )]
-    async fn get_fees_with_commitment_and_context(
-        commitment: CommitmentLevel,
-    ) -> (FeeCalculator, Hash, Slot);
     async fn get_transaction_status_with_context(signature: Signature)
         -> Option<TransactionStatus>;
     async fn get_slot_with_context(commitment: CommitmentLevel) -> Slot;
@@ -97,8 +91,8 @@ pub trait Banks {
         commitment: CommitmentLevel,
     ) -> Option<(Hash, u64)>;
     async fn get_fee_for_message_with_commitment_and_context(
-        commitment: CommitmentLevel,
         message: Message,
+        commitment: CommitmentLevel,
     ) -> Option<u64>;
 }
 

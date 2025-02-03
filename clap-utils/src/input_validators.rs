@@ -1,12 +1,11 @@
 use {
     crate::keypair::{parse_signer_source, SignerSourceKind, ASK_KEYWORD},
     chrono::DateTime,
-    solana_sdk::{
-        clock::{Epoch, Slot},
-        hash::Hash,
-        pubkey::{Pubkey, MAX_SEED_LEN},
-        signature::{read_keypair_file, Signature},
-    },
+    solana_clock::{Epoch, Slot},
+    solana_hash::Hash,
+    solana_keypair::read_keypair_file,
+    solana_pubkey::{Pubkey, MAX_SEED_LEN},
+    solana_signature::Signature,
     std::{fmt::Display, ops::RangeBounds, str::FromStr},
 };
 
@@ -334,6 +333,51 @@ where
         .map(|_| ())
 }
 
+pub fn is_structured_seed<T>(value: T) -> Result<(), String>
+where
+    T: AsRef<str> + Display,
+{
+    let (prefix, value) = value
+        .as_ref()
+        .split_once(':')
+        .ok_or("Seed must contain ':' as delimiter")
+        .unwrap();
+    if prefix.is_empty() || value.is_empty() {
+        Err(String::from("Seed prefix or value is empty"))
+    } else {
+        match prefix {
+            "string" | "pubkey" | "hex" | "u8" => Ok(()),
+            _ => {
+                let len = prefix.len();
+                if len != 5 && len != 6 {
+                    Err(format!("Wrong prefix length {len} {prefix}:{value}"))
+                } else {
+                    let sign = &prefix[0..1];
+                    let type_size = &prefix[1..len.saturating_sub(2)];
+                    let byte_order = &prefix[len.saturating_sub(2)..len];
+                    if sign != "u" && sign != "i" {
+                        Err(format!("Wrong prefix sign {sign} {prefix}:{value}"))
+                    } else if type_size != "16"
+                        && type_size != "32"
+                        && type_size != "64"
+                        && type_size != "128"
+                    {
+                        Err(format!(
+                            "Wrong prefix type size {type_size} {prefix}:{value}"
+                        ))
+                    } else if byte_order != "le" && byte_order != "be" {
+                        Err(format!(
+                            "Wrong prefix byte order {byte_order} {prefix}:{value}"
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn is_derived_address_seed<T>(value: T) -> Result<(), String>
 where
     T: AsRef<str> + Display,
@@ -348,22 +392,31 @@ where
     }
 }
 
-pub fn is_niceness_adjustment_valid<T>(value: T) -> Result<(), String>
+pub fn validate_maximum_full_snapshot_archives_to_retain<T>(value: T) -> Result<(), String>
 where
     T: AsRef<str> + Display,
 {
-    let adjustment = value
-        .as_ref()
-        .parse::<i8>()
-        .map_err(|err| format!("error parsing niceness adjustment value '{value}': {err}"))?;
-    if solana_perf::thread::is_renice_allowed(adjustment) {
-        Ok(())
-    } else {
+    let value = value.as_ref();
+    if value.eq("0") {
         Err(String::from(
-            "niceness adjustment supported only on Linux; negative adjustment \
-             (priority increase) requires root or CAP_SYS_NICE (see `man 7 capabilities` \
-             for details)",
+            "--maximum-full-snapshot-archives-to-retain cannot be zero",
         ))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn validate_maximum_incremental_snapshot_archives_to_retain<T>(value: T) -> Result<(), String>
+where
+    T: AsRef<str> + Display,
+{
+    let value = value.as_ref();
+    if value.eq("0") {
+        Err(String::from(
+            "--maximum-incremental-snapshot-archives-to-retain cannot be zero",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -382,12 +435,5 @@ mod tests {
         assert!(is_derivation("4294967296").is_err());
         assert!(is_derivation("a/b").is_err());
         assert!(is_derivation("0/4294967296").is_err());
-    }
-
-    #[test]
-    fn test_is_niceness_adjustment_valid() {
-        assert_eq!(is_niceness_adjustment_valid("0"), Ok(()));
-        assert!(is_niceness_adjustment_valid("128").is_err());
-        assert!(is_niceness_adjustment_valid("-129").is_err());
     }
 }

@@ -3,15 +3,15 @@ use {
         block_metadata_notifier_interface::BlockMetadataNotifier,
         geyser_plugin_manager::GeyserPluginManager,
     },
-    log::*,
-    solana_geyser_plugin_interface::geyser_plugin_interface::{
-        ReplicaBlockInfoV2, ReplicaBlockInfoVersions,
+    agave_geyser_plugin_interface::geyser_plugin_interface::{
+        ReplicaBlockInfoV4, ReplicaBlockInfoVersions,
     },
+    log::*,
+    solana_clock::UnixTimestamp,
     solana_measure::measure::Measure,
     solana_metrics::*,
-    solana_runtime::bank::RewardInfo,
-    solana_sdk::{clock::UnixTimestamp, pubkey::Pubkey},
-    solana_transaction_status::{Reward, Rewards},
+    solana_runtime::bank::KeyedRewardsAndNumPartitions,
+    solana_transaction_status::{Reward, RewardsAndNumPartitions},
     std::sync::{Arc, RwLock},
 };
 
@@ -27,30 +27,33 @@ impl BlockMetadataNotifier for BlockMetadataNotifierImpl {
         parent_blockhash: &str,
         slot: u64,
         blockhash: &str,
-        rewards: &RwLock<Vec<(Pubkey, RewardInfo)>>,
+        rewards: &KeyedRewardsAndNumPartitions,
         block_time: Option<UnixTimestamp>,
         block_height: Option<u64>,
         executed_transaction_count: u64,
+        entry_count: u64,
     ) {
-        let mut plugin_manager = self.plugin_manager.write().unwrap();
+        let plugin_manager = self.plugin_manager.read().unwrap();
         if plugin_manager.plugins.is_empty() {
             return;
         }
-        let rewards = Self::build_rewards(rewards);
 
-        for plugin in plugin_manager.plugins.iter_mut() {
+        let rewards = Self::build_rewards(rewards);
+        let block_info = Self::build_replica_block_info(
+            parent_slot,
+            parent_blockhash,
+            slot,
+            blockhash,
+            &rewards,
+            block_time,
+            block_height,
+            executed_transaction_count,
+            entry_count,
+        );
+
+        for plugin in plugin_manager.plugins.iter() {
             let mut measure = Measure::start("geyser-plugin-update-slot");
-            let block_info = Self::build_replica_block_info(
-                parent_slot,
-                parent_blockhash,
-                slot,
-                blockhash,
-                &rewards,
-                block_time,
-                block_height,
-                executed_transaction_count,
-            );
-            let block_info = ReplicaBlockInfoVersions::V0_0_2(&block_info);
+            let block_info = ReplicaBlockInfoVersions::V0_0_4(&block_info);
             match plugin.notify_block_metadata(block_info) {
                 Err(err) => {
                     error!(
@@ -80,18 +83,21 @@ impl BlockMetadataNotifier for BlockMetadataNotifierImpl {
 }
 
 impl BlockMetadataNotifierImpl {
-    fn build_rewards(rewards: &RwLock<Vec<(Pubkey, RewardInfo)>>) -> Rewards {
-        let rewards = rewards.read().unwrap();
-        rewards
-            .iter()
-            .map(|(pubkey, reward)| Reward {
-                pubkey: pubkey.to_string(),
-                lamports: reward.lamports,
-                post_balance: reward.post_balance,
-                reward_type: Some(reward.reward_type),
-                commission: reward.commission,
-            })
-            .collect()
+    fn build_rewards(rewards: &KeyedRewardsAndNumPartitions) -> RewardsAndNumPartitions {
+        RewardsAndNumPartitions {
+            rewards: rewards
+                .keyed_rewards
+                .iter()
+                .map(|(pubkey, reward)| Reward {
+                    pubkey: pubkey.to_string(),
+                    lamports: reward.lamports,
+                    post_balance: reward.post_balance,
+                    reward_type: Some(reward.reward_type),
+                    commission: reward.commission,
+                })
+                .collect(),
+            num_partitions: rewards.num_partitions,
+        }
     }
 
     fn build_replica_block_info<'a>(
@@ -99,12 +105,13 @@ impl BlockMetadataNotifierImpl {
         parent_blockhash: &'a str,
         slot: u64,
         blockhash: &'a str,
-        rewards: &'a [Reward],
+        rewards: &'a RewardsAndNumPartitions,
         block_time: Option<UnixTimestamp>,
         block_height: Option<u64>,
         executed_transaction_count: u64,
-    ) -> ReplicaBlockInfoV2<'a> {
-        ReplicaBlockInfoV2 {
+        entry_count: u64,
+    ) -> ReplicaBlockInfoV4<'a> {
+        ReplicaBlockInfoV4 {
             parent_slot,
             parent_blockhash,
             slot,
@@ -113,6 +120,7 @@ impl BlockMetadataNotifierImpl {
             block_time,
             block_height,
             executed_transaction_count,
+            entry_count,
         }
     }
 

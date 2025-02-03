@@ -8,7 +8,7 @@
 //! [`solana-sdk`] crate, which reexports all modules from `solana-program`.
 //!
 //! [std]: https://doc.rust-lang.org/stable/std/
-//! [sstd]: https://docs.solana.com/developing/on-chain-programs/developing-rust#restrictions
+//! [sstd]: https://solana.com/docs/programs/lang-rust#restrictions
 //! [`solana-sdk`]: https://docs.rs/solana-sdk/latest/solana_sdk/
 //!
 //! This library defines
@@ -148,7 +148,7 @@
 //! For a more complete description of Solana's implementation of eBPF and its
 //! limitations, see the main Solana documentation for [on-chain programs][ocp].
 //!
-//! [ocp]: https://docs.solana.com/developing/on-chain-programs/overview
+//! [ocp]: https://solana.com/docs/programs
 //!
 //! # Core data types
 //!
@@ -173,7 +173,7 @@
 //!   [_lamports_], the smallest fractional unit of SOL, in the [`native_token`]
 //!   module.
 //!
-//! [acc]: https://docs.solana.com/developing/programming-model/accounts
+//! [acc]: https://solana.com/docs/core/accounts
 //! [`Pubkey`]: pubkey::Pubkey
 //! [`Hash`]: hash::Hash
 //! [`Instruction`]: instruction::Instruction
@@ -184,7 +184,7 @@
 //! [`Keypair`]: https://docs.rs/solana-sdk/latest/solana_sdk/signer/keypair/struct.Keypair.html
 //! [SHA-256]: https://en.wikipedia.org/wiki/SHA-2
 //! [`Sol`]: native_token::Sol
-//! [_lamports_]: https://docs.solana.com/introduction#what-are-sols
+//! [_lamports_]: https://solana.com/docs/intro#what-are-sols
 //!
 //! # Serialization
 //!
@@ -248,7 +248,7 @@
 //!   language-independent serialization format. It is not generally recommended
 //!   for new code.
 //!
-//!   [`Pack`]: program_pack::Pack
+//!   [`Pack`]: https://docs.rs/solana-program-pack/latest/trait.Pack.html
 //!
 //! Developers should carefully consider the CPU cost of serialization, balanced
 //! against the need for correctness and ease of use: off-the-shelf
@@ -272,7 +272,7 @@
 //!
 //! [`invoke`]: program::invoke
 //! [`invoke_signed`]: program::invoke_signed
-//! [cpi]: https://docs.solana.com/developing/programming-model/calling-between-programs
+//! [cpi]: https://solana.com/docs/core/cpi
 //!
 //! A simple example of transferring lamports via CPI:
 //!
@@ -298,20 +298,16 @@
 //!
 //!     let payer = next_account_info(account_info_iter)?;
 //!     let recipient = next_account_info(account_info_iter)?;
-//!     // The system program is a required account to invoke a system
-//!     // instruction, even though we don't use it directly.
-//!     let system_account = next_account_info(account_info_iter)?;
 //!
 //!     assert!(payer.is_writable);
 //!     assert!(payer.is_signer);
 //!     assert!(recipient.is_writable);
-//!     assert!(system_program::check_id(system_account.key));
 //!
 //!     let lamports = 1000000;
 //!
 //!     invoke(
 //!         &system_instruction::transfer(payer.key, recipient.key, lamports),
-//!         &[payer.clone(), recipient.clone(), system_account.clone()],
+//!         &[payer.clone(), recipient.clone()],
 //!     )
 //! }
 //! ```
@@ -323,7 +319,7 @@
 //! `invoke_signed` to call another program while virtually "signing" for the
 //! PDA.
 //!
-//! [pdas]: https://docs.solana.com/developing/programming-model/calling-between-programs#program-derived-addresses
+//! [pdas]: https://solana.com/docs/core/cpi#program-derived-addresses
 //! [`Pubkey::find_program_address`]: pubkey::Pubkey::find_program_address
 //!
 //! A simple example of creating an account for a PDA:
@@ -395,7 +391,7 @@
 //! Some solana programs are [_native programs_][np2], running native machine
 //! code that is distributed with the runtime, with well-known program IDs.
 //!
-//! [np2]: https://docs.solana.com/developing/runtime-facilities/programs
+//! [np2]: https://docs.solanalabs.com/runtime/programs
 //!
 //! Some native programs can be [invoked][cpi] by other programs, but some can
 //! only be executed as "top-level" instructions included by off-chain clients
@@ -420,7 +416,7 @@
 //! active on any particular network. The `solana feature status` CLI command
 //! can help in determining active features.
 //!
-//! [slot]: https://docs.solana.com/terminology#slot
+//! [slot]: https://solana.com/docs/terminology#slot
 //!
 //! Native programs important to Solana program authors include:
 //!
@@ -465,96 +461,147 @@
 //!   - Instruction: [`solana_program::loader_instruction`]
 //!   - Invokable by programs? yes
 //!
-//! [lut]: https://docs.solana.com/proposals/versioned-transactions
+//! [lut]: https://docs.solanalabs.com/proposals/versioned-transactions
 
 #![allow(incomplete_features)]
-#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(specialization))]
-#![cfg_attr(RUSTC_NEEDS_PROC_MACRO_HYGIENE, feature(proc_macro_hygiene))]
+#![cfg_attr(feature = "frozen-abi", feature(specialization))]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 // Allows macro expansion of `use ::solana_program::*` to work within this crate
 extern crate self as solana_program;
 
-pub mod account_info;
-pub mod address_lookup_table_account;
-pub mod alt_bn128;
-pub(crate) mod atomic_u64;
-pub mod big_mod_exp;
-pub mod blake3;
-pub mod borsh;
+pub mod address_lookup_table;
 pub mod bpf_loader;
 pub mod bpf_loader_deprecated;
 pub mod bpf_loader_upgradeable;
-pub mod clock;
-pub mod debug_account_data;
-pub mod decode_error;
+pub mod compute_units;
 pub mod ed25519_program;
-pub mod entrypoint;
 pub mod entrypoint_deprecated;
 pub mod epoch_schedule;
-pub mod feature;
-pub mod fee_calculator;
+pub mod epoch_stake;
 pub mod hash;
 pub mod incinerator;
 pub mod instruction;
-pub mod keccak;
 pub mod lamports;
-pub mod loader_instruction;
-pub mod loader_upgradeable_instruction;
+pub mod loader_upgradeable_instruction {
+    #[deprecated(
+        since = "2.2.0",
+        note = "Use solana_loader_v3_interface::instruction instead"
+    )]
+    pub use solana_loader_v3_interface::instruction::UpgradeableLoaderInstruction;
+}
+pub mod loader_v4;
+pub mod loader_v4_instruction {
+    #[deprecated(
+        since = "2.2.0",
+        note = "Use solana_loader_v4_interface::instruction instead"
+    )]
+    pub use solana_loader_v4_interface::instruction::LoaderV4Instruction;
+}
 pub mod log;
-pub mod message;
-pub mod native_token;
 pub mod nonce;
 pub mod program;
 pub mod program_error;
-pub mod program_memory;
-pub mod program_option;
-pub mod program_pack;
-pub mod program_stubs;
 pub mod program_utils;
-pub mod pubkey;
-pub mod rent;
-pub mod sanitize;
 pub mod secp256k1_program;
-pub mod secp256k1_recover;
-pub mod serde_varint;
-pub mod serialize_utils;
-pub mod short_vec;
 pub mod slot_hashes;
 pub mod slot_history;
-pub mod stable_layout;
 pub mod stake;
 pub mod stake_history;
 pub mod syscalls;
 pub mod system_instruction;
 pub mod system_program;
 pub mod sysvar;
-pub mod vote;
 pub mod wasm;
 
-#[cfg(target_os = "solana")]
-pub use solana_sdk_macro::wasm_bindgen_stub as wasm_bindgen;
-/// Re-export of [wasm-bindgen].
-///
-/// [wasm-bindgen]: https://rustwasm.github.io/docs/wasm-bindgen/
+#[deprecated(since = "2.2.0", note = "Use `solana-big-mod-exp` crate instead")]
+pub use solana_big_mod_exp as big_mod_exp;
+#[deprecated(since = "2.2.0", note = "Use `solana-blake3-hasher` crate instead")]
+pub use solana_blake3_hasher as blake3;
+#[cfg(feature = "borsh")]
+#[deprecated(since = "2.1.0", note = "Use `solana-borsh` crate instead")]
+pub use solana_borsh::deprecated as borsh;
+#[cfg(feature = "borsh")]
+#[deprecated(since = "2.1.0", note = "Use `solana-borsh` crate instead")]
+pub use solana_borsh::v0_10 as borsh0_10;
+#[cfg(feature = "borsh")]
+#[deprecated(since = "2.1.0", note = "Use `solana-borsh` crate instead")]
+pub use solana_borsh::v1 as borsh1;
+#[deprecated(since = "2.1.0", note = "Use `solana-epoch-rewards` crate instead")]
+pub use solana_epoch_rewards as epoch_rewards;
+#[deprecated(
+    since = "2.2.0",
+    note = "Use `solana-feature-gate-interface` crate instead"
+)]
+pub use solana_feature_gate_interface as feature;
+#[deprecated(since = "2.1.0", note = "Use `solana-fee-calculator` crate instead")]
+pub use solana_fee_calculator as fee_calculator;
+#[deprecated(since = "2.2.0", note = "Use `solana-keccak-hasher` crate instead")]
+pub use solana_keccak_hasher as keccak;
+#[deprecated(since = "2.1.0", note = "Use `solana-last-restart-slot` crate instead")]
+pub use solana_last_restart_slot as last_restart_slot;
+#[deprecated(
+    since = "2.2.0",
+    note = "Use `solana-loader-v2-interface` crate instead"
+)]
+pub use solana_loader_v2_interface as loader_instruction;
+#[deprecated(since = "2.2.0", note = "Use `solana-message` crate instead")]
+pub use solana_message as message;
+#[deprecated(since = "2.1.0", note = "Use `solana-program-memory` crate instead")]
+pub use solana_program_memory as program_memory;
+#[deprecated(since = "2.1.0", note = "Use `solana-program-pack` crate instead")]
+pub use solana_program_pack as program_pack;
+#[deprecated(since = "2.1.0", note = "Use `solana-sanitize` crate instead")]
+pub use solana_sanitize as sanitize;
+#[deprecated(since = "2.1.0", note = "Use `solana-secp256k1-recover` crate instead")]
+pub use solana_secp256k1_recover as secp256k1_recover;
+#[deprecated(since = "2.1.0", note = "Use `solana-serde-varint` crate instead")]
+pub use solana_serde_varint as serde_varint;
+#[deprecated(since = "2.1.0", note = "Use `solana-serialize-utils` crate instead")]
+pub use solana_serialize_utils as serialize_utils;
+#[deprecated(since = "2.1.0", note = "Use `solana-short-vec` crate instead")]
+pub use solana_short_vec as short_vec;
+#[deprecated(since = "2.1.0", note = "Use `solana-stable-layout` crate instead")]
+pub use solana_stable_layout as stable_layout;
 #[cfg(not(target_os = "solana"))]
+pub use solana_sysvar::program_stubs;
+#[deprecated(since = "2.2.0", note = "Use `solana-vote-interface` crate instead")]
+pub use solana_vote_interface as vote;
+#[cfg(target_arch = "wasm32")]
 pub use wasm_bindgen::prelude::wasm_bindgen;
-
+pub use {
+    solana_account_info::{self as account_info, debug_account_data},
+    solana_clock as clock,
+    solana_msg::msg,
+    solana_native_token as native_token,
+    solana_program_entrypoint::{
+        self as entrypoint, custom_heap_default, custom_panic_default, entrypoint,
+        entrypoint_no_alloc,
+    },
+    solana_program_option as program_option, solana_pubkey as pubkey, solana_rent as rent,
+    solana_sysvar::impl_sysvar_get,
+};
 /// The [config native program][np].
 ///
-/// [np]: https://docs.solana.com/developing/runtime-facilities/programs#config-program
+/// [np]: https://docs.solanalabs.com/runtime/programs#config-program
 pub mod config {
     pub mod program {
-        crate::declare_id!("Config1111111111111111111111111111111111111");
+        pub use solana_sdk_ids::config::{check_id, id, ID};
     }
 }
 
 /// A vector of Solana SDK IDs.
+#[deprecated(
+    since = "2.0.0",
+    note = "Please use `solana_sdk::reserved_account_keys::ReservedAccountKeys` instead"
+)]
+#[allow(deprecated)]
 pub mod sdk_ids {
     use {
         crate::{
-            bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, config, ed25519_program,
-            feature, incinerator, secp256k1_program, solana_program::pubkey::Pubkey, stake,
-            system_program, sysvar, vote,
+            address_lookup_table, bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable,
+            config, ed25519_program, feature, incinerator, loader_v4, secp256k1_program,
+            solana_program::pubkey::Pubkey, stake, system_program, sysvar, vote,
         },
         lazy_static::lazy_static,
     };
@@ -573,6 +620,10 @@ pub mod sdk_ids {
                 vote::program::id(),
                 feature::id(),
                 bpf_loader_deprecated::id(),
+                address_lookup_table::program::id(),
+                loader_v4::id(),
+                stake::program::id(),
+                #[allow(deprecated)]
                 stake::config::id(),
             ];
             sdk_ids.extend(sysvar::ALL_IDS.iter());
@@ -581,52 +632,11 @@ pub mod sdk_ids {
     }
 }
 
-/// Same as [`declare_id`] except that it reports that this ID has been deprecated.
-pub use solana_sdk_macro::program_declare_deprecated_id as declare_deprecated_id;
-/// Convenience macro to declare a static public key and functions to interact with it.
-///
-/// Input: a single literal base58 string representation of a program's ID.
-///
-/// # Example
-///
-/// ```
-/// # // wrapper is used so that the macro invocation occurs in the item position
-/// # // rather than in the statement position which isn't allowed.
-/// use std::str::FromStr;
-/// use solana_program::{declare_id, pubkey::Pubkey};
-///
-/// # mod item_wrapper {
-/// #   use solana_program::declare_id;
-/// declare_id!("My11111111111111111111111111111111111111111");
-/// # }
-/// # use item_wrapper::id;
-///
-/// let my_id = Pubkey::from_str("My11111111111111111111111111111111111111111").unwrap();
-/// assert_eq!(id(), my_id);
-/// ```
-pub use solana_sdk_macro::program_declare_id as declare_id;
-/// Convenience macro to define a static public key.
-///
-/// Input: a single literal base58 string representation of a Pubkey.
-///
-/// # Example
-///
-/// ```
-/// use std::str::FromStr;
-/// use solana_program::{pubkey, pubkey::Pubkey};
-///
-/// static ID: Pubkey = pubkey!("My11111111111111111111111111111111111111111");
-///
-/// let my_id = Pubkey::from_str("My11111111111111111111111111111111111111111").unwrap();
-/// assert_eq!(ID, my_id);
-/// ```
-pub use solana_sdk_macro::program_pubkey as pubkey;
-
-#[macro_use]
-extern crate serde_derive;
-
-#[macro_use]
-extern crate solana_frozen_abi_macro;
+#[deprecated(since = "2.1.0", note = "Use `solana-decode-error` crate instead")]
+pub use solana_decode_error as decode_error;
+pub use solana_pubkey::{declare_deprecated_id, declare_id, pubkey};
+#[deprecated(since = "2.1.0", note = "Use `solana-sysvar-id` crate instead")]
+pub use solana_sysvar_id::{declare_deprecated_sysvar_id, declare_sysvar_id};
 
 /// Convenience macro for doing integer division where the operation's safety
 /// can be checked at compile-time.
@@ -739,20 +749,21 @@ macro_rules! unchecked_div_by_const {
         // ugly error messages!
         // https://users.rust-lang.org/t/unexpected-behavior-of-compile-time-integer-div-by-zero-check-in-declarative-macro/56718
         let _ = [(); ($den as usize) - 1];
-        #[allow(clippy::integer_arithmetic)]
+        #[allow(clippy::arithmetic_side_effects)]
         let quotient = $num / $den;
         quotient
     }};
 }
 
-// This module is purposefully listed after all other exports: because of an
+// This re-export is purposefully listed after all other exports: because of an
 // interaction within rustdoc between the reexports inside this module of
 // `solana_program`'s top-level modules, and `solana_sdk`'s glob re-export of
-// `solana_program`'s top-level modules, if this module is not lexically last
+// `solana_program`'s top-level modules, if this re-export is not lexically last
 // rustdoc fails to generate documentation for the re-exports within
 // `solana_sdk`.
+#[deprecated(since = "2.2.0", note = "Use solana-example-mocks instead")]
 #[cfg(not(target_os = "solana"))]
-pub mod example_mocks;
+pub use solana_example_mocks as example_mocks;
 
 #[cfg(test)]
 mod tests {

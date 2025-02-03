@@ -1,16 +1,15 @@
 use {
     crate::response::RpcSimulateTransactionResult,
     serde_json::{json, Value},
-    solana_sdk::{clock::Slot, pubkey::Pubkey},
+    solana_clock::Slot,
+    solana_pubkey::Pubkey,
     std::fmt,
     thiserror::Error,
 };
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum RpcRequest {
-    Custom {
-        method: &'static str,
-    },
+    Custom { method: &'static str },
     DeregisterNode,
     GetAccountInfo,
     GetBalance,
@@ -21,43 +20,9 @@ pub enum RpcRequest {
     GetBlocksWithLimit,
     GetBlockTime,
     GetClusterNodes,
-    #[deprecated(since = "1.7.0", note = "Please use RpcRequest::GetBlock instead")]
-    GetConfirmedBlock,
-    #[deprecated(since = "1.7.0", note = "Please use RpcRequest::GetBlocks instead")]
-    GetConfirmedBlocks,
-    #[deprecated(
-        since = "1.7.0",
-        note = "Please use RpcRequest::GetBlocksWithLimit instead"
-    )]
-    GetConfirmedBlocksWithLimit,
-    #[deprecated(
-        since = "1.7.0",
-        note = "Please use RpcRequest::GetSignaturesForAddress instead"
-    )]
-    GetConfirmedSignaturesForAddress2,
-    #[deprecated(
-        since = "1.7.0",
-        note = "Please use RpcRequest::GetTransaction instead"
-    )]
-    GetConfirmedTransaction,
     GetEpochInfo,
     GetEpochSchedule,
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please use RpcRequest::GetFeeForMessage instead"
-    )]
-    GetFeeCalculatorForBlockhash,
     GetFeeForMessage,
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please do not use, will no longer be available in the future"
-    )]
-    GetFeeRateGovernor,
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please use RpcRequest::GetFeeForMessage instead"
-    )]
-    GetFees,
     GetFirstAvailableBlock,
     GetGenesisHash,
     GetHealth,
@@ -73,19 +38,9 @@ pub enum RpcRequest {
     GetMinimumBalanceForRentExemption,
     GetMultipleAccounts,
     GetProgramAccounts,
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please use RpcRequest::GetLatestBlockhash instead"
-    )]
-    GetRecentBlockhash,
     GetRecentPerformanceSamples,
     GetRecentPrioritizationFees,
     GetHighestSnapshotSlot,
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please use RpcRequest::GetHighestSnapshotSlot instead"
-    )]
-    GetSnapshotSlot,
     GetSignaturesForAddress,
     GetSignatureStatuses,
     GetSlot,
@@ -94,7 +49,6 @@ pub enum RpcRequest {
     GetStorageTurn,
     GetStorageTurnRate,
     GetSlotsPerSegment,
-    GetStakeActivation,
     GetStakeMinimumDelegation,
     GetStoragePubkeysForSlot,
     GetSupply,
@@ -131,17 +85,9 @@ impl fmt::Display for RpcRequest {
             RpcRequest::GetBlocksWithLimit => "getBlocksWithLimit",
             RpcRequest::GetBlockTime => "getBlockTime",
             RpcRequest::GetClusterNodes => "getClusterNodes",
-            RpcRequest::GetConfirmedBlock => "getConfirmedBlock",
-            RpcRequest::GetConfirmedBlocks => "getConfirmedBlocks",
-            RpcRequest::GetConfirmedBlocksWithLimit => "getConfirmedBlocksWithLimit",
-            RpcRequest::GetConfirmedSignaturesForAddress2 => "getConfirmedSignaturesForAddress2",
-            RpcRequest::GetConfirmedTransaction => "getConfirmedTransaction",
             RpcRequest::GetEpochInfo => "getEpochInfo",
             RpcRequest::GetEpochSchedule => "getEpochSchedule",
-            RpcRequest::GetFeeCalculatorForBlockhash => "getFeeCalculatorForBlockhash",
             RpcRequest::GetFeeForMessage => "getFeeForMessage",
-            RpcRequest::GetFeeRateGovernor => "getFeeRateGovernor",
-            RpcRequest::GetFees => "getFees",
             RpcRequest::GetFirstAvailableBlock => "getFirstAvailableBlock",
             RpcRequest::GetGenesisHash => "getGenesisHash",
             RpcRequest::GetHealth => "getHealth",
@@ -157,17 +103,14 @@ impl fmt::Display for RpcRequest {
             RpcRequest::GetMinimumBalanceForRentExemption => "getMinimumBalanceForRentExemption",
             RpcRequest::GetMultipleAccounts => "getMultipleAccounts",
             RpcRequest::GetProgramAccounts => "getProgramAccounts",
-            RpcRequest::GetRecentBlockhash => "getRecentBlockhash",
             RpcRequest::GetRecentPerformanceSamples => "getRecentPerformanceSamples",
             RpcRequest::GetRecentPrioritizationFees => "getRecentPrioritizationFees",
             RpcRequest::GetHighestSnapshotSlot => "getHighestSnapshotSlot",
-            RpcRequest::GetSnapshotSlot => "getSnapshotSlot",
             RpcRequest::GetSignaturesForAddress => "getSignaturesForAddress",
             RpcRequest::GetSignatureStatuses => "getSignatureStatuses",
             RpcRequest::GetSlot => "getSlot",
             RpcRequest::GetSlotLeader => "getSlotLeader",
             RpcRequest::GetSlotLeaders => "getSlotLeaders",
-            RpcRequest::GetStakeActivation => "getStakeActivation",
             RpcRequest::GetStakeMinimumDelegation => "getStakeMinimumDelegation",
             RpcRequest::GetStorageTurn => "getStorageTurn",
             RpcRequest::GetStorageTurnRate => "getStorageTurnRate",
@@ -243,8 +186,11 @@ impl fmt::Display for RpcResponseErrorData {
                 if logs.is_empty() {
                     Ok(())
                 } else {
-                    // Give the user a hint that there is more useful logging information available...
-                    write!(f, "[{} log messages]", logs.len())
+                    writeln!(f, "{} log messages:", logs.len())?;
+                    for log in logs {
+                        writeln!(f, "  {log}")?;
+                    }
+                    Ok(())
                 }
             }
             _ => Ok(()),
@@ -253,10 +199,11 @@ impl fmt::Display for RpcResponseErrorData {
 }
 
 #[derive(Debug, Error)]
+#[allow(clippy::large_enum_variant)]
 pub enum RpcError {
     #[error("RPC request error: {0}")]
     RpcRequestError(String),
-    #[error("RPC response error {code}: {message} {data}")]
+    #[error("RPC response error {code}: {message}; {data}")]
     RpcResponseError {
         code: i64,
         message: String,
@@ -281,7 +228,7 @@ mod tests {
     use {
         super::*,
         crate::config::RpcTokenAccountsFilter,
-        solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel},
+        solana_commitment_config::{CommitmentConfig, CommitmentLevel},
     };
 
     #[test]
@@ -300,20 +247,9 @@ mod tests {
         let request = test_request.build_request_json(1, Value::Null);
         assert_eq!(request["method"], "getEpochInfo");
 
-        #[allow(deprecated)]
-        let test_request = RpcRequest::GetRecentBlockhash;
+        let test_request = RpcRequest::GetLatestBlockhash;
         let request = test_request.build_request_json(1, Value::Null);
-        assert_eq!(request["method"], "getRecentBlockhash");
-
-        #[allow(deprecated)]
-        let test_request = RpcRequest::GetFeeCalculatorForBlockhash;
-        let request = test_request.build_request_json(1, json!([addr]));
-        assert_eq!(request["method"], "getFeeCalculatorForBlockhash");
-
-        #[allow(deprecated)]
-        let test_request = RpcRequest::GetFeeRateGovernor;
-        let request = test_request.build_request_json(1, Value::Null);
-        assert_eq!(request["method"], "getFeeRateGovernor");
+        assert_eq!(request["method"], "getLatestBlockhash");
 
         let test_request = RpcRequest::GetSlot;
         let request = test_request.build_request_json(1, Value::Null);
@@ -344,8 +280,7 @@ mod tests {
         let addr = json!("deadbeefXjn8o3yroDHxUtKsZZgoy4GPkPPXfouKNHhx");
 
         // Test request with CommitmentConfig and no params
-        #[allow(deprecated)]
-        let test_request = RpcRequest::GetRecentBlockhash;
+        let test_request = RpcRequest::GetLatestBlockhash;
         let request = test_request.build_request_json(1, json!([commitment_config]));
         assert_eq!(request["params"], json!([commitment_config.clone()]));
 
@@ -356,7 +291,7 @@ mod tests {
 
         // Test request with CommitmentConfig and params
         let test_request = RpcRequest::GetTokenAccountsByOwner;
-        let mint = solana_sdk::pubkey::new_rand();
+        let mint = solana_pubkey::new_rand();
         let token_account_filter = RpcTokenAccountsFilter::Mint(mint.to_string());
         let request = test_request
             .build_request_json(1, json!([addr, token_account_filter, commitment_config]));

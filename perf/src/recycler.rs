@@ -46,7 +46,7 @@ pub struct RecyclerX<T> {
 
 impl<T: Default> Default for RecyclerX<T> {
     fn default() -> RecyclerX<T> {
-        let id = thread_rng().gen_range(0, 1000);
+        let id = thread_rng().gen_range(0..1000);
         trace!("new recycler..{}", id);
         RecyclerX {
             gc: Mutex::default(),
@@ -54,6 +54,15 @@ impl<T: Default> Default for RecyclerX<T> {
             id,
             size_factor: AtomicUsize::default(),
         }
+    }
+}
+
+#[cfg(feature = "frozen-abi")]
+impl solana_frozen_abi::abi_example::AbiExample
+    for RecyclerX<crate::cuda_runtime::PinnedVec<solana_packet::Packet>>
+{
+    fn example() -> Self {
+        Self::default()
     }
 }
 
@@ -78,7 +87,6 @@ fn warm_recyclers() -> bool {
 }
 
 impl<T: Default + Reset + Sized> Recycler<T> {
-    #[allow(clippy::needless_collect)]
     pub fn warmed(num: usize, size_hint: usize) -> Self {
         let new = Self::default();
         if warm_recyclers() {
@@ -229,10 +237,10 @@ mod tests {
         assert_eq!(recycler.recycler.gc.lock().unwrap().len(), NUM_PACKETS);
         // Process a normal load of packets for a while.
         for _ in 0..RECYCLER_SHRINK_WINDOW / 16 {
-            let count = rng.gen_range(1, 128);
+            let count = rng.gen_range(1..128);
             let _packets: Vec<_> = repeat_with(|| recycler.allocate("")).take(count).collect();
         }
-        // Assert that the gc size has shrinked.
+        // Assert that the gc size has shrunk.
         assert_eq!(
             recycler.recycler.gc.lock().unwrap().len(),
             RECYCLER_SHRINK_SIZE

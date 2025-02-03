@@ -1,21 +1,18 @@
 use {
-    crate::{
-        shred::{
-            common::dispatch,
-            legacy, merkle,
-            traits::{Shred, ShredCode as ShredCodeTrait},
-            CodingShredHeader, Error, ShredCommonHeader, ShredType, SignedData,
-            DATA_SHREDS_PER_FEC_BLOCK, MAX_DATA_SHREDS_PER_SLOT, SIZE_OF_NONCE,
-        },
-        shredder::ERASURE_BATCH_SIZE,
+    crate::shred::{
+        common::dispatch,
+        legacy, merkle,
+        payload::Payload,
+        traits::{Shred, ShredCode as ShredCodeTrait},
+        CodingShredHeader, Error, ShredCommonHeader, ShredType, SignedData,
+        DATA_SHREDS_PER_FEC_BLOCK, MAX_DATA_SHREDS_PER_SLOT, SIZE_OF_NONCE,
     },
-    solana_sdk::{clock::Slot, packet::PACKET_DATA_SIZE, signature::Signature},
+    solana_sdk::{clock::Slot, hash::Hash, packet::PACKET_DATA_SIZE, signature::Signature},
     static_assertions::const_assert_eq,
 };
 
-const_assert_eq!(MAX_CODE_SHREDS_PER_SLOT, 32_768 * 17);
-pub(crate) const MAX_CODE_SHREDS_PER_SLOT: usize =
-    MAX_DATA_SHREDS_PER_SLOT * (ERASURE_BATCH_SIZE[1] - 1);
+const_assert_eq!(MAX_CODE_SHREDS_PER_SLOT, 32_768);
+pub const MAX_CODE_SHREDS_PER_SLOT: usize = MAX_DATA_SHREDS_PER_SLOT;
 
 const_assert_eq!(ShredCode::SIZE_OF_PAYLOAD, 1228);
 
@@ -31,12 +28,11 @@ impl ShredCode {
     dispatch!(fn coding_header(&self) -> &CodingShredHeader);
 
     dispatch!(pub(super) fn common_header(&self) -> &ShredCommonHeader);
-    dispatch!(pub(super) fn erasure_shard(self) -> Result<Vec<u8>, Error>);
-    dispatch!(pub(super) fn erasure_shard_as_slice(&self) -> Result<&[u8], Error>);
+    dispatch!(pub(super) fn erasure_shard(&self) -> Result<&[u8], Error>);
     dispatch!(pub(super) fn erasure_shard_index(&self) -> Result<usize, Error>);
     dispatch!(pub(super) fn first_coding_index(&self) -> Option<u32>);
-    dispatch!(pub(super) fn into_payload(self) -> Vec<u8>);
-    dispatch!(pub(super) fn payload(&self) -> &Vec<u8>);
+    dispatch!(pub(super) fn into_payload(self) -> Payload);
+    dispatch!(pub(super) fn payload(&self) -> &Payload);
     dispatch!(pub(super) fn sanitize(&self) -> Result<(), Error>);
     dispatch!(pub(super) fn set_signature(&mut self, signature: Signature));
 
@@ -48,6 +44,20 @@ impl ShredCode {
         match self {
             Self::Legacy(shred) => Ok(SignedData::Chunk(shred.signed_data()?)),
             Self::Merkle(shred) => Ok(SignedData::MerkleRoot(shred.signed_data()?)),
+        }
+    }
+
+    pub(super) fn chained_merkle_root(&self) -> Result<Hash, Error> {
+        match self {
+            Self::Legacy(_) => Err(Error::InvalidShredType),
+            Self::Merkle(shred) => shred.chained_merkle_root(),
+        }
+    }
+
+    pub(super) fn merkle_root(&self) -> Result<Hash, Error> {
+        match self {
+            Self::Legacy(_) => Err(Error::InvalidShredType),
+            Self::Merkle(shred) => shred.merkle_root(),
         }
     }
 
@@ -94,6 +104,13 @@ impl ShredCode {
                 erasure_mismatch(shred, other)
                     || shred.common_header().signature != other.common_header().signature
             }
+        }
+    }
+
+    pub(super) fn retransmitter_signature(&self) -> Result<Signature, Error> {
+        match self {
+            Self::Legacy(_) => Err(Error::InvalidShredVariant),
+            Self::Merkle(shred) => shred.retransmitter_signature(),
         }
     }
 }
@@ -157,7 +174,7 @@ pub(super) fn sanitize<T: ShredCodeTrait>(shred: &T) -> Result<(), Error> {
         ));
     }
     let _shard_index = shred.erasure_shard_index()?;
-    let _erasure_shard = shred.erasure_shard_as_slice()?;
+    let _erasure_shard = shred.erasure_shard()?;
     Ok(())
 }
 

@@ -1,14 +1,16 @@
 /// Module responsible for notifying plugins of transactions
 use {
     crate::geyser_plugin_manager::GeyserPluginManager,
-    log::*,
-    solana_geyser_plugin_interface::geyser_plugin_interface::{
+    agave_geyser_plugin_interface::geyser_plugin_interface::{
         ReplicaTransactionInfoV2, ReplicaTransactionInfoVersions,
     },
+    log::*,
+    solana_clock::Slot,
     solana_measure::measure::Measure,
     solana_metrics::*,
     solana_rpc::transaction_notifier_interface::TransactionNotifier,
-    solana_sdk::{clock::Slot, signature::Signature, transaction::SanitizedTransaction},
+    solana_signature::Signature,
+    solana_transaction::sanitized::SanitizedTransaction,
     solana_transaction_status::TransactionStatusMeta,
     std::sync::{Arc, RwLock},
 };
@@ -38,13 +40,13 @@ impl TransactionNotifier for TransactionNotifierImpl {
             transaction,
         );
 
-        let mut plugin_manager = self.plugin_manager.write().unwrap();
+        let plugin_manager = self.plugin_manager.read().unwrap();
 
         if plugin_manager.plugins.is_empty() {
             return;
         }
 
-        for plugin in plugin_manager.plugins.iter_mut() {
+        for plugin in plugin_manager.plugins.iter() {
             if !plugin.transaction_notifications_enabled() {
                 continue;
             }

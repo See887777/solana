@@ -1,5 +1,7 @@
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 use {
+    agave_banking_stage_ingress_types::BankingPacketBatch,
+    assert_matches::assert_matches,
     clap::{crate_description, crate_name, Arg, ArgEnum, Command},
     crossbeam_channel::{unbounded, Receiver},
     log::*,
@@ -7,20 +9,23 @@ use {
     rayon::prelude::*,
     solana_client::connection_cache::ConnectionCache,
     solana_core::{
-        banking_stage::BankingStage,
-        banking_trace::{BankingPacketBatch, BankingTracer, BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT},
+        banking_stage::{update_bank_forks_and_poh_recorder_for_new_tpu_bank, BankingStage},
+        banking_trace::{BankingTracer, Channels, BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT},
+        validator::{BlockProductionMethod, TransactionStructure},
     },
     solana_gossip::cluster_info::{ClusterInfo, Node},
     solana_ledger::{
         blockstore::Blockstore,
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
-        get_tmp_ledger_path,
+        get_tmp_ledger_path_auto_delete,
         leader_schedule_cache::LeaderScheduleCache,
     },
     solana_measure::measure::Measure,
     solana_perf::packet::{to_packet_batches, PacketBatch},
     solana_poh::poh_recorder::{create_test_recorder, PohRecorder, WorkingBankEntry},
-    solana_runtime::{bank::Bank, bank_forks::BankForks},
+    solana_runtime::{
+        bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
+    },
     solana_sdk::{
         compute_budget::ComputeBudgetInstruction,
         hash::Hash,
@@ -28,7 +33,7 @@ use {
         pubkey::{self, Pubkey},
         signature::{Keypair, Signature, Signer},
         system_instruction, system_transaction,
-        timing::{duration_as_us, timestamp},
+        timing::timestamp,
         transaction::Transaction,
     },
     solana_streamer::socket::SocketAddrSpace,
@@ -132,7 +137,7 @@ fn make_accounts_txs(
                 hash,
                 compute_unit_price,
             );
-            let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen::<u8>()).collect();
+            let sig: [u8; 64] = std::array::from_fn(|_| thread_rng().gen::<u8>());
             new.message.account_keys[0] = pubkey::new_rand();
             new.message.account_keys[1] = match contention {
                 WriteLockContention::None => pubkey::new_rand(),
@@ -146,7 +151,7 @@ fn make_accounts_txs(
                 }
                 WriteLockContention::Full => to_pubkey,
             };
-            new.signatures = vec![Signature::new(&sig[0..64])];
+            new.signatures = vec![Signature::from(sig)];
             new
         })
         .collect()
@@ -218,8 +223,8 @@ impl PacketsPerIteration {
     fn refresh_blockhash(&mut self, new_blockhash: Hash) {
         for tx in self.transactions.iter_mut() {
             tx.message.recent_blockhash = new_blockhash;
-            let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen::<u8>()).collect();
-            tx.signatures[0] = Signature::new(&sig[0..64]);
+            let sig: [u8; 64] = std::array::from_fn(|_| thread_rng().gen::<u8>());
+            tx.signatures[0] = Signature::from(sig);
         }
         self.packet_batches = to_packet_batches(&self.transactions, self.packets_per_batch);
     }
@@ -278,6 +283,22 @@ fn main() {
                 .help("Number of batches to send in each iteration"),
         )
         .arg(
+            Arg::with_name("block_production_method")
+                .long("block-production-method")
+                .value_name("METHOD")
+                .takes_value(true)
+                .possible_values(BlockProductionMethod::cli_names())
+                .help(BlockProductionMethod::cli_message()),
+        )
+        .arg(
+            Arg::with_name("transaction_struct")
+                .long("transaction-structure")
+                .value_name("STRUCT")
+                .takes_value(true)
+                .possible_values(TransactionStructure::cli_names())
+                .help(TransactionStructure::cli_message()),
+        )
+        .arg(
             Arg::new("num_banking_threads")
                 .long("num-banking-threads")
                 .takes_value(true)
@@ -304,6 +325,12 @@ fn main() {
         )
         .get_matches();
 
+    let block_production_method = matches
+        .value_of_t::<BlockProductionMethod>("block_production_method")
+        .unwrap_or_default();
+    let transaction_struct = matches
+        .value_of_t::<TransactionStructure>("transaction_struct")
+        .unwrap_or_default();
     let num_banking_threads = matches
         .value_of_t::<u32>("num_banking_threads")
         .unwrap_or_else(|_| BankingStage::num_threads());
@@ -332,13 +359,13 @@ fn main() {
 
     let (replay_vote_sender, _replay_vote_receiver) = unbounded();
     let bank0 = Bank::new_for_benches(&genesis_config);
-    let bank_forks = Arc::new(RwLock::new(BankForks::new(bank0)));
-    let mut bank = bank_forks.read().unwrap().working_bank();
+    let bank_forks = BankForks::new_rw_arc(bank0);
+    let mut bank = bank_forks.read().unwrap().working_bank_with_scheduler();
 
     // set cost tracker limits to MAX so it will not filter out TXs
     bank.write_cost_tracker()
         .unwrap()
-        .set_limits(std::u64::MAX, std::u64::MAX, std::u64::MAX);
+        .set_limits(u64::MAX, u64::MAX, u64::MAX);
 
     let mut all_packets: Vec<PacketsPerIteration> = std::iter::from_fn(|| {
         Some(PacketsPerIteration::new(
@@ -375,8 +402,8 @@ fn main() {
                     genesis_config.hash(),
                 );
                 // Ignore any pesky duplicate signature errors in the case we are using single-payer
-                let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen::<u8>()).collect();
-                fund.signatures = vec![Signature::new(&sig[0..64])];
+                let sig: [u8; 64] = std::array::from_fn(|_| thread_rng().gen::<u8>());
+                fund.signatures = vec![Signature::from(sig)];
                 bank.process_transaction(&fund).unwrap();
             });
     });
@@ -408,201 +435,218 @@ fn main() {
         }
     }
 
-    let ledger_path = get_tmp_ledger_path!();
-    {
-        let blockstore = Arc::new(
-            Blockstore::open(&ledger_path).expect("Expected to be able to open database ledger"),
-        );
-        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
-        let (exit, poh_recorder, poh_service, signal_receiver) =
-            create_test_recorder(&bank, &blockstore, None, Some(leader_schedule_cache));
-        let (banking_tracer, tracer_thread) =
-            BankingTracer::new(matches.is_present("trace_banking").then_some((
-                &blockstore.banking_trace_path(),
-                exit.clone(),
-                BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT,
-            )))
-            .unwrap();
-        let (non_vote_sender, non_vote_receiver) = banking_tracer.create_channel_non_vote();
-        let (tpu_vote_sender, tpu_vote_receiver) = banking_tracer.create_channel_tpu_vote();
-        let (gossip_vote_sender, gossip_vote_receiver) =
-            banking_tracer.create_channel_gossip_vote();
-        let cluster_info = {
-            let keypair = Arc::new(Keypair::new());
-            let node = Node::new_localhost_with_pubkey(&keypair.pubkey());
-            ClusterInfo::new(node.info, keypair, SocketAddrSpace::Unspecified)
-        };
-        let cluster_info = Arc::new(cluster_info);
-        let tpu_use_quic = matches.is_present("tpu_use_quic");
-        let connection_cache = match tpu_use_quic {
-            true => ConnectionCache::new(DEFAULT_TPU_CONNECTION_POOL_SIZE),
-            false => ConnectionCache::with_udp(DEFAULT_TPU_CONNECTION_POOL_SIZE),
-        };
-        let banking_stage = BankingStage::new_num_threads(
-            &cluster_info,
-            &poh_recorder,
-            non_vote_receiver,
-            tpu_vote_receiver,
-            gossip_vote_receiver,
-            num_banking_threads,
-            None,
-            replay_vote_sender,
-            None,
-            Arc::new(connection_cache),
-            bank_forks.clone(),
-        );
-        poh_recorder.write().unwrap().set_bank(&bank, false);
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore = Arc::new(
+        Blockstore::open(ledger_path.path()).expect("Expected to be able to open database ledger"),
+    );
+    let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
+    let (exit, poh_recorder, poh_service, signal_receiver) = create_test_recorder(
+        bank.clone(),
+        blockstore.clone(),
+        None,
+        Some(leader_schedule_cache),
+    );
+    let (banking_tracer, tracer_thread) =
+        BankingTracer::new(matches.is_present("trace_banking").then_some((
+            &blockstore.banking_trace_path(),
+            exit.clone(),
+            BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT,
+        )))
+        .unwrap();
+    let prioritization_fee_cache = Arc::new(PrioritizationFeeCache::new(0u64));
+    let cluster_info = {
+        let keypair = Arc::new(Keypair::new());
+        let node = Node::new_localhost_with_pubkey(&keypair.pubkey());
+        ClusterInfo::new(node.info, keypair, SocketAddrSpace::Unspecified)
+    };
+    let cluster_info = Arc::new(cluster_info);
+    let Channels {
+        non_vote_sender,
+        non_vote_receiver,
+        tpu_vote_sender,
+        tpu_vote_receiver,
+        gossip_vote_sender,
+        gossip_vote_receiver,
+    } = banking_tracer.create_channels(false);
+    let tpu_disable_quic = matches.is_present("tpu_disable_quic");
+    let connection_cache = if tpu_disable_quic {
+        ConnectionCache::with_udp(
+            "connection_cache_banking_bench_udp",
+            DEFAULT_TPU_CONNECTION_POOL_SIZE,
+        )
+    } else {
+        ConnectionCache::new_quic(
+            "connection_cache_banking_bench_quic",
+            DEFAULT_TPU_CONNECTION_POOL_SIZE,
+        )
+    };
+    let banking_stage = BankingStage::new_num_threads(
+        block_production_method,
+        transaction_struct,
+        &cluster_info,
+        &poh_recorder,
+        non_vote_receiver,
+        tpu_vote_receiver,
+        gossip_vote_receiver,
+        num_banking_threads,
+        None,
+        replay_vote_sender,
+        None,
+        Arc::new(connection_cache),
+        bank_forks.clone(),
+        &prioritization_fee_cache,
+        false,
+    );
 
-        // This is so that the signal_receiver does not go out of scope after the closure.
-        // If it is dropped before poh_service, then poh_service will error when
-        // calling send() on the channel.
-        let signal_receiver = Arc::new(signal_receiver);
-        let mut total_us = 0;
-        let mut tx_total_us = 0;
-        let base_tx_count = bank.transaction_count();
-        let mut txs_processed = 0;
-        let collector = solana_sdk::pubkey::new_rand();
-        let mut total_sent = 0;
-        for current_iteration_index in 0..iterations {
-            trace!("RUNNING ITERATION {}", current_iteration_index);
-            let now = Instant::now();
-            let mut sent = 0;
+    // This is so that the signal_receiver does not go out of scope after the closure.
+    // If it is dropped before poh_service, then poh_service will error when
+    // calling send() on the channel.
+    let signal_receiver = Arc::new(signal_receiver);
+    let mut total_us = 0;
+    let mut tx_total_us = 0;
+    let base_tx_count = bank.transaction_count();
+    let mut txs_processed = 0;
+    let collector = solana_sdk::pubkey::new_rand();
+    let mut total_sent = 0;
+    for current_iteration_index in 0..iterations {
+        trace!("RUNNING ITERATION {}", current_iteration_index);
+        let now = Instant::now();
+        let mut sent = 0;
 
-            let packets_for_this_iteration = &all_packets[current_iteration_index % num_chunks];
-            for (packet_batch_index, packet_batch) in
-                packets_for_this_iteration.packet_batches.iter().enumerate()
-            {
-                sent += packet_batch.len();
-                trace!(
-                    "Sending PacketBatch index {}, {}",
-                    packet_batch_index,
-                    timestamp(),
-                );
-                non_vote_sender
-                    .send(BankingPacketBatch::new((vec![packet_batch.clone()], None)))
-                    .unwrap();
-            }
+        let packets_for_this_iteration = &all_packets[current_iteration_index % num_chunks];
+        for (packet_batch_index, packet_batch) in
+            packets_for_this_iteration.packet_batches.iter().enumerate()
+        {
+            sent += packet_batch.len();
+            trace!(
+                "Sending PacketBatch index {}, {}",
+                packet_batch_index,
+                timestamp(),
+            );
+            non_vote_sender
+                .send(BankingPacketBatch::new(vec![packet_batch.clone()]))
+                .unwrap();
+        }
 
-            for tx in &packets_for_this_iteration.transactions {
-                loop {
-                    if bank.get_signature_status(&tx.signatures[0]).is_some() {
-                        break;
-                    }
-                    if poh_recorder.read().unwrap().bank().is_none() {
-                        break;
-                    }
-                    sleep(Duration::from_millis(5));
+        for tx in &packets_for_this_iteration.transactions {
+            loop {
+                if bank.get_signature_status(&tx.signatures[0]).is_some() {
+                    break;
                 }
-            }
-
-            // check if txs had been processed by bank. Returns when all transactions are
-            // processed, with `FALSE` indicate there is still bank. or returns TRUE indicate a
-            // bank has expired before receiving all txs.
-            if check_txs(
-                &signal_receiver,
-                packets_for_this_iteration.transactions.len(),
-                &poh_recorder,
-            ) {
-                eprintln!(
-                    "[iteration {}, tx sent {}, slot {} expired, bank tx count {}]",
-                    current_iteration_index,
-                    sent,
-                    bank.slot(),
-                    bank.transaction_count(),
-                );
-                tx_total_us += duration_as_us(&now.elapsed());
-
-                let mut poh_time = Measure::start("poh_time");
-                poh_recorder
-                    .write()
-                    .unwrap()
-                    .reset(bank.clone(), Some((bank.slot(), bank.slot() + 1)));
-                poh_time.stop();
-
-                let mut new_bank_time = Measure::start("new_bank");
-                let new_bank = Bank::new_from_parent(&bank, &collector, bank.slot() + 1);
-                new_bank_time.stop();
-
-                let mut insert_time = Measure::start("insert_time");
-                bank_forks.write().unwrap().insert(new_bank);
-                bank = bank_forks.read().unwrap().working_bank();
-                insert_time.stop();
-
-                // set cost tracker limits to MAX so it will not filter out TXs
-                bank.write_cost_tracker().unwrap().set_limits(
-                    std::u64::MAX,
-                    std::u64::MAX,
-                    std::u64::MAX,
-                );
-
-                poh_recorder.write().unwrap().set_bank(&bank, false);
-                assert!(poh_recorder.read().unwrap().bank().is_some());
-                debug!(
-                    "new_bank_time: {}us insert_time: {}us poh_time: {}us",
-                    new_bank_time.as_us(),
-                    insert_time.as_us(),
-                    poh_time.as_us(),
-                );
-            } else {
-                eprintln!(
-                    "[iteration {}, tx sent {}, slot {} active, bank tx count {}]",
-                    current_iteration_index,
-                    sent,
-                    bank.slot(),
-                    bank.transaction_count(),
-                );
-                tx_total_us += duration_as_us(&now.elapsed());
-            }
-
-            // This signature clear may not actually clear the signatures
-            // in this chunk, but since we rotate between CHUNKS then
-            // we should clear them by the time we come around again to re-use that chunk.
-            bank.clear_signatures();
-            total_us += duration_as_us(&now.elapsed());
-            total_sent += sent;
-
-            if current_iteration_index % num_chunks == 0 {
-                let last_blockhash = bank.last_blockhash();
-                for packets_for_single_iteration in all_packets.iter_mut() {
-                    packets_for_single_iteration.refresh_blockhash(last_blockhash);
+                if poh_recorder.read().unwrap().bank().is_none() {
+                    break;
                 }
+                sleep(Duration::from_millis(5));
             }
         }
-        txs_processed += bank_forks
-            .read()
-            .unwrap()
-            .working_bank()
-            .transaction_count();
-        debug!("processed: {} base: {}", txs_processed, base_tx_count);
 
-        eprintln!("[total_sent: {}, base_tx_count: {}, txs_processed: {}, txs_landed: {}, total_us: {}, tx_total_us: {}]",
-            total_sent, base_tx_count, txs_processed, (txs_processed - base_tx_count), total_us, tx_total_us);
+        // check if txs had been processed by bank. Returns when all transactions are
+        // processed, with `FALSE` indicate there is still bank. or returns TRUE indicate a
+        // bank has expired before receiving all txs.
+        if check_txs(
+            &signal_receiver,
+            packets_for_this_iteration.transactions.len(),
+            &poh_recorder,
+        ) {
+            eprintln!(
+                "[iteration {}, tx sent {}, slot {} expired, bank tx count {}]",
+                current_iteration_index,
+                sent,
+                bank.slot(),
+                bank.transaction_count(),
+            );
+            tx_total_us += now.elapsed().as_micros() as u64;
 
-        eprintln!(
-            "{{'name': 'banking_bench_total', 'median': '{:.2}'}}",
-            (1000.0 * 1000.0 * total_sent as f64) / (total_us as f64),
-        );
-        eprintln!(
-            "{{'name': 'banking_bench_tx_total', 'median': '{:.2}'}}",
-            (1000.0 * 1000.0 * total_sent as f64) / (tx_total_us as f64),
-        );
-        eprintln!(
-            "{{'name': 'banking_bench_success_tx_total', 'median': '{:.2}'}}",
-            (1000.0 * 1000.0 * (txs_processed - base_tx_count) as f64) / (total_us as f64),
-        );
+            let mut poh_time = Measure::start("poh_time");
+            poh_recorder
+                .write()
+                .unwrap()
+                .reset(bank.clone(), Some((bank.slot(), bank.slot() + 1)));
+            poh_time.stop();
 
-        drop(non_vote_sender);
-        drop(tpu_vote_sender);
-        drop(gossip_vote_sender);
-        exit.store(true, Ordering::Relaxed);
-        banking_stage.join().unwrap();
-        debug!("waited for banking_stage");
-        poh_service.join().unwrap();
-        sleep(Duration::from_secs(1));
-        debug!("waited for poh_service");
-        if let Some(tracer_thread) = tracer_thread {
-            tracer_thread.join().unwrap().unwrap();
+            let mut new_bank_time = Measure::start("new_bank");
+            if let Some((result, _timings)) = bank.wait_for_completed_scheduler() {
+                assert_matches!(result, Ok(_));
+            }
+            let new_slot = bank.slot() + 1;
+            let new_bank = Bank::new_from_parent(bank.clone(), &collector, new_slot);
+            new_bank_time.stop();
+
+            let mut insert_time = Measure::start("insert_time");
+            assert_matches!(poh_recorder.read().unwrap().bank(), None);
+            update_bank_forks_and_poh_recorder_for_new_tpu_bank(
+                &bank_forks,
+                &poh_recorder,
+                new_bank,
+                false,
+            );
+            bank = bank_forks.read().unwrap().working_bank_with_scheduler();
+            assert_matches!(poh_recorder.read().unwrap().bank(), Some(_));
+            insert_time.stop();
+            debug!(
+                "new_bank_time: {}us insert_time: {}us poh_time: {}us",
+                new_bank_time.as_us(),
+                insert_time.as_us(),
+                poh_time.as_us(),
+            );
+        } else {
+            eprintln!(
+                "[iteration {}, tx sent {}, slot {} active, bank tx count {}]",
+                current_iteration_index,
+                sent,
+                bank.slot(),
+                bank.transaction_count(),
+            );
+            tx_total_us += now.elapsed().as_micros() as u64;
+        }
+
+        // This signature clear may not actually clear the signatures
+        // in this chunk, but since we rotate between CHUNKS then
+        // we should clear them by the time we come around again to re-use that chunk.
+        bank.clear_signatures();
+        total_us += now.elapsed().as_micros() as u64;
+        total_sent += sent;
+
+        if current_iteration_index % num_chunks == 0 {
+            let last_blockhash = bank.last_blockhash();
+            for packets_for_single_iteration in all_packets.iter_mut() {
+                packets_for_single_iteration.refresh_blockhash(last_blockhash);
+            }
         }
     }
-    let _unused = Blockstore::destroy(&ledger_path);
+    txs_processed += bank_forks
+        .read()
+        .unwrap()
+        .working_bank()
+        .transaction_count();
+    debug!("processed: {} base: {}", txs_processed, base_tx_count);
+
+    eprintln!("[total_sent: {}, base_tx_count: {}, txs_processed: {}, txs_landed: {}, total_us: {}, tx_total_us: {}]",
+            total_sent, base_tx_count, txs_processed, (txs_processed - base_tx_count), total_us, tx_total_us);
+
+    eprintln!(
+        "{{'name': 'banking_bench_total', 'median': '{:.2}'}}",
+        (1000.0 * 1000.0 * total_sent as f64) / (total_us as f64),
+    );
+    eprintln!(
+        "{{'name': 'banking_bench_tx_total', 'median': '{:.2}'}}",
+        (1000.0 * 1000.0 * total_sent as f64) / (tx_total_us as f64),
+    );
+    eprintln!(
+        "{{'name': 'banking_bench_success_tx_total', 'median': '{:.2}'}}",
+        (1000.0 * 1000.0 * (txs_processed - base_tx_count) as f64) / (total_us as f64),
+    );
+
+    drop(non_vote_sender);
+    drop(tpu_vote_sender);
+    drop(gossip_vote_sender);
+    exit.store(true, Ordering::Relaxed);
+    banking_stage.join().unwrap();
+    debug!("waited for banking_stage");
+    poh_service.join().unwrap();
+    sleep(Duration::from_secs(1));
+    debug!("waited for poh_service");
+    if let Some(tracer_thread) = tracer_thread {
+        tracer_thread.join().unwrap().unwrap();
+    }
 }

@@ -1,10 +1,11 @@
 use {
-    solana_client::{
-        nonblocking::tpu_client::{LeaderTpuService, TpuClient},
-        tpu_client::TpuClientConfig,
-    },
-    solana_sdk::{clock::DEFAULT_MS_PER_SLOT, pubkey::Pubkey, system_transaction},
+    solana_client::nonblocking::tpu_client::{LeaderTpuService, TpuClient},
+    solana_clock::DEFAULT_MS_PER_SLOT,
+    solana_connection_cache::connection_cache::Protocol,
+    solana_pubkey::Pubkey,
+    solana_system_transaction as system_transaction,
     solana_test_validator::TestValidatorGenesis,
+    solana_tpu_client::tpu_client::TpuClientConfig,
     std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -17,6 +18,7 @@ async fn test_tpu_send_transaction() {
     let (test_validator, mint_keypair) = TestValidatorGenesis::default().start_async().await;
     let rpc_client = Arc::new(test_validator.get_async_rpc_client());
     let mut tpu_client = TpuClient::new(
+        "tpu_client_test",
         rpc_client.clone(),
         &test_validator.rpc_pubsub_url(),
         TpuClientConfig::default(),
@@ -38,7 +40,7 @@ async fn test_tpu_send_transaction() {
             .get_signature_statuses(&signatures)
             .await
             .unwrap();
-        if statuses.value.get(0).is_some() {
+        if !statuses.value.is_empty() {
             break;
         }
     }
@@ -50,10 +52,14 @@ async fn test_tpu_cache_slot_updates() {
     let (test_validator, _) = TestValidatorGenesis::default().start_async().await;
     let rpc_client = Arc::new(test_validator.get_async_rpc_client());
     let exit = Arc::new(AtomicBool::new(false));
-    let mut leader_tpu_service =
-        LeaderTpuService::new(rpc_client, &test_validator.rpc_pubsub_url(), exit.clone())
-            .await
-            .unwrap();
+    let mut leader_tpu_service = LeaderTpuService::new(
+        rpc_client,
+        &test_validator.rpc_pubsub_url(),
+        Protocol::QUIC,
+        exit.clone(),
+    )
+    .await
+    .unwrap();
     let start_slot = leader_tpu_service.estimated_current_slot();
     let timeout = Duration::from_secs(5);
     let sleep_time = Duration::from_millis(DEFAULT_MS_PER_SLOT);

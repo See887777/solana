@@ -41,8 +41,8 @@ _ $cargoNightly build --release
 rm -f "$BENCH_FILE"
 
 # Run sdk benches
-_ $cargoNightly bench --manifest-path sdk/Cargo.toml ${V:+--verbose} \
-  -- -Z unstable-options --format=json | tee -a "$BENCH_FILE"
+_ $cargoNightly bench --manifest-path sdk/sdk/Cargo.toml ${V:+--verbose} \
+  --features openssl-vendored -- -Z unstable-options --format=json | tee -a "$BENCH_FILE"
 
 # Run runtime benches
 _ $cargoNightly bench --manifest-path runtime/Cargo.toml ${V:+--verbose} \
@@ -61,6 +61,7 @@ _ $cargoNightly bench --manifest-path core/Cargo.toml ${V:+--verbose} \
   -- -Z unstable-options --format=json | tee -a "$BENCH_FILE"
 
 # Run sbf benches
+_ make -C programs/sbf all
 _ $cargoNightly bench --manifest-path programs/sbf/Cargo.toml ${V:+--verbose} --features=sbf_c \
   -- -Z unstable-options --format=json --nocapture | tee -a "$BENCH_FILE"
 

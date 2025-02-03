@@ -1,12 +1,13 @@
 use {
-    solana_account_decoder::parse_token::{
-        is_known_spl_token_id, pubkey_from_spl_token, spl_token_native_mint,
-        token_amount_to_ui_amount, UiTokenAmount,
+    solana_account_decoder::{
+        parse_account_data::SplTokenAdditionalDataV2,
+        parse_token::{is_known_spl_token_id, token_amount_to_ui_amount_v3, UiTokenAmount},
     },
     solana_measure::measure::Measure,
     solana_metrics::datapoint_debug,
     solana_runtime::{bank::Bank, transaction_batch::TransactionBatch},
     solana_sdk::{account::ReadableAccount, pubkey::Pubkey},
+    solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction_status::{
         token_balances::TransactionTokenBalances, TransactionTokenBalance,
     },
@@ -18,7 +19,7 @@ use {
 };
 
 fn get_mint_decimals(bank: &Bank, mint: &Pubkey) -> Option<u8> {
-    if mint == &spl_token_native_mint() {
+    if mint == &spl_token::native_mint::id() {
         Some(spl_token::native_mint::DECIMALS)
     } else {
         let mint_account = bank.get_account(mint)?;
@@ -37,20 +38,20 @@ fn get_mint_decimals(bank: &Bank, mint: &Pubkey) -> Option<u8> {
 
 pub fn collect_token_balances(
     bank: &Bank,
-    batch: &TransactionBatch,
+    batch: &TransactionBatch<impl SVMMessage>,
     mint_decimals: &mut HashMap<Pubkey, u8>,
 ) -> TransactionTokenBalances {
     let mut balances: TransactionTokenBalances = vec![];
     let mut collect_time = Measure::start("collect_token_balances");
 
     for transaction in batch.sanitized_transactions() {
-        let account_keys = transaction.message().account_keys();
+        let account_keys = transaction.account_keys();
         let has_token_program = account_keys.iter().any(is_known_spl_token_id);
 
         let mut transaction_balances: Vec<TransactionTokenBalance> = vec![];
         if has_token_program {
             for (index, account_id) in account_keys.iter().enumerate() {
-                if transaction.message().is_invoked(index) || is_known_spl_token_id(account_id) {
+                if transaction.is_invoked(index) || is_known_spl_token_id(account_id) {
                     continue;
                 }
 
@@ -101,7 +102,7 @@ fn collect_token_balance_from_account(
     }
 
     let token_account = StateWithExtensions::<TokenAccount>::unpack(account.data()).ok()?;
-    let mint = pubkey_from_spl_token(&token_account.base.mint);
+    let mint = token_account.base.mint;
 
     let decimals = mint_decimals.get(&mint).cloned().or_else(|| {
         let decimals = get_mint_decimals(bank, &mint)?;
@@ -112,7 +113,13 @@ fn collect_token_balance_from_account(
     Some(TokenBalanceData {
         mint: token_account.base.mint.to_string(),
         owner: token_account.base.owner.to_string(),
-        ui_token_amount: token_amount_to_ui_amount(token_account.base.amount, decimals),
+        ui_token_amount: token_amount_to_ui_amount_v3(
+            token_account.base.amount,
+            // NOTE: Same as parsed instruction data, ledger data always uses
+            // the raw token amount, and does not calculate the UI amount with
+            // any consideration for interest.
+            &SplTokenAdditionalDataV2::with_decimals(decimals),
+        ),
         program_id: account.owner().to_string(),
     })
 }
@@ -121,14 +128,14 @@ fn collect_token_balance_from_account(
 mod test {
     use {
         super::*,
-        solana_account_decoder::parse_token::{pubkey_from_spl_token, spl_token_pubkey},
         solana_sdk::{account::Account, genesis_config::create_genesis_config},
+        spl_pod::optional_keys::OptionalNonZeroPubkey,
         spl_token_2022::{
             extension::{
                 immutable_owner::ImmutableOwner, memo_transfer::MemoTransfer,
-                mint_close_authority::MintCloseAuthority, ExtensionType, StateWithExtensionsMut,
+                mint_close_authority::MintCloseAuthority, BaseStateWithExtensionsMut,
+                ExtensionType, StateWithExtensionsMut,
             },
-            pod::OptionalNonZeroPubkey,
             solana_program::{program_option::COption, program_pack::Pack},
         },
         std::collections::BTreeMap,
@@ -154,7 +161,7 @@ mod test {
         let mint = Account {
             lamports: 100,
             data: data.to_vec(),
-            owner: pubkey_from_spl_token(&spl_token::id()),
+            owner: spl_token::id(),
             executable: false,
             rent_epoch: 0,
         };
@@ -169,8 +176,8 @@ mod test {
 
         let token_owner = Pubkey::new_unique();
         let token_data = TokenAccount {
-            mint: spl_token_pubkey(&mint_pubkey),
-            owner: spl_token_pubkey(&token_owner),
+            mint: mint_pubkey,
+            owner: token_owner,
             amount: 42,
             delegate: COption::None,
             state: spl_token_2022::state::AccountState::Initialized,
@@ -184,7 +191,7 @@ mod test {
         let spl_token_account = Account {
             lamports: 100,
             data: data.to_vec(),
-            owner: pubkey_from_spl_token(&spl_token::id()),
+            owner: spl_token::id(),
             executable: false,
             rent_epoch: 0,
         };
@@ -197,8 +204,8 @@ mod test {
         };
 
         let other_mint_data = TokenAccount {
-            mint: spl_token_pubkey(&other_mint_pubkey),
-            owner: spl_token_pubkey(&token_owner),
+            mint: other_mint_pubkey,
+            owner: token_owner,
             amount: 42,
             delegate: COption::None,
             state: spl_token_2022::state::AccountState::Initialized,
@@ -212,7 +219,7 @@ mod test {
         let other_mint_token_account = Account {
             lamports: 100,
             data: data.to_vec(),
-            owner: pubkey_from_spl_token(&spl_token::id()),
+            owner: spl_token::id(),
             executable: false,
             rent_epoch: 0,
         };
@@ -293,7 +300,8 @@ mod test {
 
         let mint_authority = Pubkey::new_unique();
         let mint_size =
-            ExtensionType::get_account_len::<Mint>(&[ExtensionType::MintCloseAuthority]);
+            ExtensionType::try_calculate_account_len::<Mint>(&[ExtensionType::MintCloseAuthority])
+                .unwrap();
         let mint_base = Mint {
             mint_authority: COption::None,
             supply: 4242,
@@ -307,17 +315,17 @@ mod test {
         mint_state.base = mint_base;
         mint_state.pack_base();
         mint_state.init_account_type().unwrap();
-        let mut mint_close_authority = mint_state
+        let mint_close_authority = mint_state
             .init_extension::<MintCloseAuthority>(true)
             .unwrap();
         mint_close_authority.close_authority =
-            OptionalNonZeroPubkey::try_from(Some(spl_token_pubkey(&mint_authority))).unwrap();
+            OptionalNonZeroPubkey::try_from(Some(mint_authority)).unwrap();
 
         let mint_pubkey = Pubkey::new_unique();
         let mint = Account {
             lamports: 100,
             data: mint_data.to_vec(),
-            owner: pubkey_from_spl_token(&spl_token_2022::id()),
+            owner: spl_token_2022::id(),
             executable: false,
             rent_epoch: 0,
         };
@@ -332,8 +340,8 @@ mod test {
 
         let token_owner = Pubkey::new_unique();
         let token_base = TokenAccount {
-            mint: spl_token_pubkey(&mint_pubkey),
-            owner: spl_token_pubkey(&token_owner),
+            mint: mint_pubkey,
+            owner: token_owner,
             amount: 42,
             delegate: COption::None,
             state: spl_token_2022::state::AccountState::Initialized,
@@ -341,10 +349,11 @@ mod test {
             delegated_amount: 0,
             close_authority: COption::None,
         };
-        let account_size = ExtensionType::get_account_len::<TokenAccount>(&[
+        let account_size = ExtensionType::try_calculate_account_len::<TokenAccount>(&[
             ExtensionType::ImmutableOwner,
             ExtensionType::MemoTransfer,
-        ]);
+        ])
+        .unwrap();
         let mut account_data = vec![0; account_size];
         let mut account_state =
             StateWithExtensionsMut::<TokenAccount>::unpack_uninitialized(&mut account_data)
@@ -355,13 +364,13 @@ mod test {
         account_state
             .init_extension::<ImmutableOwner>(true)
             .unwrap();
-        let mut memo_transfer = account_state.init_extension::<MemoTransfer>(true).unwrap();
+        let memo_transfer = account_state.init_extension::<MemoTransfer>(true).unwrap();
         memo_transfer.require_incoming_transfer_memos = true.into();
 
         let spl_token_account = Account {
             lamports: 100,
             data: account_data.to_vec(),
-            owner: pubkey_from_spl_token(&spl_token_2022::id()),
+            owner: spl_token_2022::id(),
             executable: false,
             rent_epoch: 0,
         };
@@ -374,8 +383,8 @@ mod test {
         };
 
         let other_mint_token_base = TokenAccount {
-            mint: spl_token_pubkey(&other_mint_pubkey),
-            owner: spl_token_pubkey(&token_owner),
+            mint: other_mint_pubkey,
+            owner: token_owner,
             amount: 42,
             delegate: COption::None,
             state: spl_token_2022::state::AccountState::Initialized,
@@ -383,10 +392,11 @@ mod test {
             delegated_amount: 0,
             close_authority: COption::None,
         };
-        let account_size = ExtensionType::get_account_len::<TokenAccount>(&[
+        let account_size = ExtensionType::try_calculate_account_len::<TokenAccount>(&[
             ExtensionType::ImmutableOwner,
             ExtensionType::MemoTransfer,
-        ]);
+        ])
+        .unwrap();
         let mut account_data = vec![0; account_size];
         let mut account_state =
             StateWithExtensionsMut::<TokenAccount>::unpack_uninitialized(&mut account_data)
@@ -397,13 +407,13 @@ mod test {
         account_state
             .init_extension::<ImmutableOwner>(true)
             .unwrap();
-        let mut memo_transfer = account_state.init_extension::<MemoTransfer>(true).unwrap();
+        let memo_transfer = account_state.init_extension::<MemoTransfer>(true).unwrap();
         memo_transfer.require_incoming_transfer_memos = true.into();
 
         let other_mint_token_account = Account {
             lamports: 100,
             data: account_data.to_vec(),
-            owner: pubkey_from_spl_token(&spl_token_2022::id()),
+            owner: spl_token_2022::id(),
             executable: false,
             rent_epoch: 0,
         };

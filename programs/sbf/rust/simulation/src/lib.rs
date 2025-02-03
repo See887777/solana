@@ -1,3 +1,5 @@
+#![allow(clippy::arithmetic_side_effects)]
+
 use {
     solana_program::{
         account_info::{next_account_info, AccountInfo},
@@ -13,7 +15,7 @@ use {
 
 declare_id!("Sim1jD5C35odT8mzctm8BWnjic8xW5xgeb5MbcbErTo");
 
-solana_program::entrypoint!(process_instruction);
+solana_program::entrypoint_no_alloc!(process_instruction);
 
 pub fn process_instruction(
     _program_id: &Pubkey,
@@ -29,7 +31,7 @@ pub fn process_instruction(
     let slot: u64 = u64::from_le_bytes(data[data.len() - 8..].try_into().unwrap());
 
     let clock_from_cache = Clock::get().unwrap();
-    let clock_from_account = Clock::from_account_info(&clock_account_info).unwrap();
+    let clock_from_account = Clock::from_account_info(clock_account_info).unwrap();
 
     msg!("next_slot from slot history is {:?} ", slot);
     msg!("clock from cache is in slot {:?} ", clock_from_cache.slot);

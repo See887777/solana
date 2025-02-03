@@ -30,6 +30,7 @@ extraPrimordialStakes="${21:=0}"
 tmpfsAccounts="${22:false}"
 disableQuic="${23}"
 enableUdp="${24}"
+maybeWenRestart="${25}"
 
 set +x
 
@@ -107,9 +108,6 @@ cat >> ~/solana/on-reboot <<EOF
   PATH="$HOME"/.cargo/bin:"$PATH"
   export USE_INSTALL=1
 
-  sudo RUST_LOG=info ~solana/.cargo/bin/solana-sys-tuner --user $(whoami) > sys-tuner.log 2>&1 &
-  echo \$! > sys-tuner.pid
-
   (
     sudo SOLANA_METRICS_CONFIG="$SOLANA_METRICS_CONFIG" scripts/oom-monitor.sh
   ) > oom-monitor.log 2>&1 &
@@ -124,7 +122,7 @@ cat >> ~/solana/on-reboot <<EOF
   echo \$! > system-stats.pid
 
   if ${GPU_CUDA_OK} && [[ -e /dev/nvidia0 ]]; then
-    echo Selecting solana-validator-cuda
+    echo Selecting agave-validator-cuda
     export SOLANA_CUDA=1
   elif ${GPU_FAIL_IF_NONE} ; then
     echo "Expected GPU, found none!"
@@ -260,14 +258,15 @@ EOF
 
       if [[ -n "$maybeWarpSlot" ]]; then
         # shellcheck disable=SC2086 # Do not want to quote $maybeWarSlot
-        solana-ledger-tool -l config/bootstrap-validator create-snapshot 0 config/bootstrap-validator $maybeWarpSlot
+        agave-ledger-tool -l config/bootstrap-validator create-snapshot 0 config/bootstrap-validator $maybeWarpSlot
       fi
 
-      solana-ledger-tool -l config/bootstrap-validator shred-version --max-genesis-archive-unpacked-size 1073741824 | tee config/shred-version
+      agave-ledger-tool -l config/bootstrap-validator shred-version --max-genesis-archive-unpacked-size 1073741824 | tee config/shred-version
 
       if [[ -n "$maybeWaitForSupermajority" ]]; then
-        bankHash=$(solana-ledger-tool -l config/bootstrap-validator bank-hash --halt-at-slot 0)
-        extraNodeArgs="$extraNodeArgs --expected-bank-hash $bankHash"
+        bankHash=$(agave-ledger-tool -l config/bootstrap-validator verify --halt-at-slot 0 --print-bank-hash --output json | jq -r ".hash")
+        shredVersion="$(cat "$SOLANA_CONFIG_DIR"/shred-version)"
+        extraNodeArgs="$extraNodeArgs --expected-bank-hash $bankHash --expected-shred-version $shredVersion"
         echo "$bankHash" > config/bank-hash
       fi
     fi
@@ -300,6 +299,11 @@ cat >> ~/solana/on-reboot <<EOF
       ./multinode-demo/faucet.sh > faucet.log 2>&1 &
 EOF
     fi
+
+    if [[ -n "$maybeWenRestart" ]]; then
+      args+=(--wen-restart "$maybeWenRestart")
+    fi
+
     # shellcheck disable=SC2206 # Don't want to double quote $extraNodeArgs
     args+=($extraNodeArgs)
 
@@ -429,6 +433,11 @@ EOF
 
     if $enableUdp; then
       args+=(--tpu-enable-udp)
+    fi
+
+    if [[ -n "$maybeWenRestart" ]]; then
+      args+=(--wen-restart wen_restart.proto3)
+      args+=(--wen-restart-coordinator "$maybeWenRestart")
     fi
 
 cat >> ~/solana/on-reboot <<EOF

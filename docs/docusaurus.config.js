@@ -1,14 +1,14 @@
 const math = require("remark-math");
 const katex = require("rehype-katex");
 module.exports = {
-  title: "Solana Docs",
+  title: "Agave",
   tagline:
-    "Solana is an open source project implementing a new, high-performance, permissionless blockchain.",
-  url: "https://docs.solana.com",
+    "Agave is an open source project implementing a new, high-performance, permissionless blockchain.",
+  url: "https://docs.anza.xyz",
   baseUrl: "/",
   favicon: "img/favicon.ico",
-  organizationName: "solana-labs", // Usually your GitHub org/user name.
-  projectName: "solana", // Usually your repo name.
+  organizationName: "anza-xyz", // Usually your GitHub org/user name.
+  projectName: "agave", // Usually your repo name.
   onBrokenLinks: "throw",
   stylesheets: [
     {
@@ -50,48 +50,34 @@ module.exports = {
     },
     navbar: {
       logo: {
-        alt: "Solana Logo",
+        alt: "Anza Logo",
         src: "img/logo-horizontal.svg",
         srcDark: "img/logo-horizontal-dark.svg",
       },
       items: [
-        {
-          to: "introduction",
-          label: "Learn",
-          position: "left",
-        },
-        {
-          to: "cluster/overview",
-          label: "Architecture",
-          position: "left",
-        },
         {
           to: "cli",
           label: "CLI",
           position: "left",
         },
         {
-          to: "/developers",
-          label: "Developers",
+          to: "architecture",
+          label: "Architecture",
           position: "left",
         },
         {
-          to: "running-validator",
-          label: "Validators",
+          to: "operations",
+          label: "Operating a Validator",
           position: "left",
         },
         {
           label: "More",
           position: "left",
           items: [
-            { label: "Terminology", to: "terminology" },
-            { label: "Staking", to: "staking" },
-            { label: "Integrations", to: "integrations/exchange" },
-            { label: "Economics", to: "economics_overview" },
             { label: "Proposals", to: "proposals" },
             {
               href: "https://spl.solana.com",
-              label: "Solana Program Library »",
+              label: "Solana Program Library",
             },
           ],
         },
@@ -100,14 +86,14 @@ module.exports = {
           position: "right",
         },
         {
-          href: "https://discordapp.com/invite/pquxPsq",
+          href: "https://solana.com/discord",
           // label: "Discord",
           className: "header-link-icon header-discord-link",
-          "aria-label": "Solana Discord",
+          "aria-label": "Solana Tech Discord",
           position: "right",
         },
         {
-          href: "https://github.com/solana-labs/solana",
+          href: "https://github.com/anza-xyz/agave/",
           // label: "GitHub",
           className: "header-link-icon header-github-link",
           "aria-label": "GitHub repository",
@@ -129,16 +115,12 @@ module.exports = {
           title: "Documentation",
           items: [
             {
-              label: "Learn",
-              to: "introduction",
+              label: "Developers »",
+              href: "https://solana.com/developers",
             },
             {
-              label: "Developers",
-              to: "/developers",
-            },
-            {
-              label: "Validators",
-              to: "running-validator",
+              label: "Running a Validator",
+              to: "operations",
             },
             {
               label: "Command Line",
@@ -146,7 +128,7 @@ module.exports = {
             },
             {
               label: "Architecture",
-              to: "cluster/overview",
+              to: "architecture",
             },
           ],
         },
@@ -159,19 +141,19 @@ module.exports = {
             },
             {
               label: "GitHub »",
-              href: "https://github.com/solana-labs/solana",
+              href: "https://github.com/anza-xyz/agave",
             },
             {
               label: "Discord »",
-              href: "https://discordapp.com/invite/pquxPsq",
+              href: "https://solana.com/discord",
             },
             {
               label: "Twitter »",
-              href: "https://twitter.com/solana",
+              href: "https://solana.com/twitter",
             },
             {
-              label: "Forums »",
-              href: "https://forums.solana.com",
+              label: "Forum »",
+              href: "https://forum.solana.com",
             },
           ],
         },
@@ -179,12 +161,12 @@ module.exports = {
           title: "Resources",
           items: [
             {
-              label: "Proposals",
-              to: "proposals",
+              label: "Terminology »",
+              href: "https://solana.com/docs/terminology",
             },
             {
-              label: "Integrations",
-              to: "integrations/exchange",
+              label: "Proposals",
+              to: "proposals",
             },
             {
               href: "https://spl.solana.com",
@@ -193,7 +175,7 @@ module.exports = {
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} Solana Foundation`,
+      copyright: `Copyright © ${new Date().getFullYear()} Anza`,
     },
   },
   presets: [
@@ -202,7 +184,7 @@ module.exports = {
       {
         docs: {
           path: "src",
-          breadcrumbs: false,
+          breadcrumbs: true,
           routeBasePath: "/",
           sidebarPath: require.resolve("./sidebars.js"),
           remarkPlugins: [math],
@@ -211,6 +193,12 @@ module.exports = {
         theme: {
           customCss: require.resolve("./src/css/custom.css"),
         },
+        // Google Analytics are only active in prod
+        // gtag: {
+        // this GA code is safe to be published
+        // trackingID: "",
+        // anonymizeIP: true,
+        // },
       },
     ],
   ],

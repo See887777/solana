@@ -31,8 +31,7 @@ pub(in crate::parse_token) fn parse_reallocate_instruction(
 mod test {
     use {
         super::*,
-        crate::parse_token::test::*,
-        solana_sdk::pubkey::Pubkey,
+        solana_pubkey::Pubkey,
         spl_token_2022::{instruction::reallocate, solana_program::message::Message},
     };
 
@@ -50,19 +49,19 @@ mod test {
         let owner_pubkey = Pubkey::new_unique();
         let reallocate_ix = reallocate(
             &spl_token_2022::id(),
-            &convert_pubkey(account_pubkey),
-            &convert_pubkey(payer_pubkey),
-            &convert_pubkey(owner_pubkey),
+            &account_pubkey,
+            &payer_pubkey,
+            &owner_pubkey,
             &[],
             &extension_types,
         )
         .unwrap();
         let message = Message::new(&[reallocate_ix], None);
-        let compiled_instruction = convert_compiled_instruction(&message.instructions[0]);
+        let compiled_instruction = &message.instructions[0];
         assert_eq!(
             parse_token(
-                &compiled_instruction,
-                &AccountKeys::new(&convert_account_keys(&message), None)
+                compiled_instruction,
+                &AccountKeys::new(&message.account_keys, None)
             )
             .unwrap(),
             ParsedInstructionEnum {
@@ -71,7 +70,7 @@ mod test {
                     "account": account_pubkey.to_string(),
                     "payer": payer_pubkey.to_string(),
                     "owner": owner_pubkey.to_string(),
-                    "systemProgram": solana_sdk::system_program::id().to_string(),
+                    "systemProgram": solana_sdk_ids::system_program::id().to_string(),
                     "extensionTypes": ["transferFeeAmount", "memoTransfer"],
                 })
             }
@@ -83,22 +82,19 @@ mod test {
         let multisig_signer1 = Pubkey::new_unique();
         let reallocate_ix = reallocate(
             &spl_token_2022::id(),
-            &convert_pubkey(account_pubkey),
-            &convert_pubkey(payer_pubkey),
-            &convert_pubkey(multisig_pubkey),
-            &[
-                &convert_pubkey(multisig_signer0),
-                &convert_pubkey(multisig_signer1),
-            ],
+            &account_pubkey,
+            &payer_pubkey,
+            &multisig_pubkey,
+            &[&multisig_signer0, &multisig_signer1],
             &extension_types,
         )
         .unwrap();
         let message = Message::new(&[reallocate_ix], None);
-        let compiled_instruction = convert_compiled_instruction(&message.instructions[0]);
+        let compiled_instruction = &message.instructions[0];
         assert_eq!(
             parse_token(
-                &compiled_instruction,
-                &AccountKeys::new(&convert_account_keys(&message), None)
+                compiled_instruction,
+                &AccountKeys::new(&message.account_keys, None)
             )
             .unwrap(),
             ParsedInstructionEnum {
@@ -111,7 +107,7 @@ mod test {
                         multisig_signer0.to_string(),
                         multisig_signer1.to_string(),
                     ],
-                    "systemProgram": solana_sdk::system_program::id().to_string(),
+                    "systemProgram": solana_sdk_ids::system_program::id().to_string(),
                     "extensionTypes": ["transferFeeAmount", "memoTransfer"],
                 })
             }

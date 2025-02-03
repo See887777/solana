@@ -5,11 +5,10 @@ use {
     bv::BitVec,
     fnv::FnvHasher,
     rand::Rng,
-    solana_bloom::bloom::{AtomicBloom, Bloom, BloomHashIndex},
-    solana_sdk::{
-        hash::{hash, Hash},
-        signature::Signature,
-    },
+    solana_bloom::bloom::{Bloom, BloomHashIndex, ConcurrentBloom},
+    solana_hash::Hash,
+    solana_sha256_hasher::hash,
+    solana_signature::Signature,
     std::{collections::HashSet, hash::Hasher},
     test::Bencher,
 };
@@ -61,7 +60,7 @@ fn bench_sigs_bloom(bencher: &mut Bencher) {
         id = hash(id.as_ref());
         sigbytes.extend(id.as_ref());
 
-        let sig = Signature::new(&sigbytes);
+        let sig = Signature::try_from(sigbytes).unwrap();
         if sigs.contains(&sig) {
             falses += 1;
         }
@@ -89,7 +88,7 @@ fn bench_sigs_hashmap(bencher: &mut Bencher) {
         id = hash(id.as_ref());
         sigbytes.extend(id.as_ref());
 
-        let sig = Signature::new(&sigbytes);
+        let sig = Signature::try_from(sigbytes).unwrap();
         if sigs.contains(&sig) {
             falses += 1;
         }
@@ -103,7 +102,7 @@ fn bench_sigs_hashmap(bencher: &mut Bencher) {
 #[bench]
 fn bench_add_hash(bencher: &mut Bencher) {
     let mut rng = rand::thread_rng();
-    let hash_values: Vec<_> = std::iter::repeat_with(|| solana_sdk::hash::new_rand(&mut rng))
+    let hash_values: Vec<_> = std::iter::repeat_with(Hash::new_unique)
         .take(1200)
         .collect();
     let mut fail = 0;
@@ -112,7 +111,7 @@ fn bench_add_hash(bencher: &mut Bencher) {
         for hash_value in &hash_values {
             bloom.add(hash_value);
         }
-        let index = rng.gen_range(0, hash_values.len());
+        let index = rng.gen_range(0..hash_values.len());
         if !bloom.contains(&hash_values[index]) {
             fail += 1;
         }
@@ -123,12 +122,12 @@ fn bench_add_hash(bencher: &mut Bencher) {
 #[bench]
 fn bench_add_hash_atomic(bencher: &mut Bencher) {
     let mut rng = rand::thread_rng();
-    let hash_values: Vec<_> = std::iter::repeat_with(|| solana_sdk::hash::new_rand(&mut rng))
+    let hash_values: Vec<_> = std::iter::repeat_with(Hash::new_unique)
         .take(1200)
         .collect();
     let mut fail = 0;
     bencher.iter(|| {
-        let bloom: AtomicBloom<_> = Bloom::random(1287, 0.1, 7424).into();
+        let bloom: ConcurrentBloom<_> = Bloom::random(1287, 0.1, 7424).into();
         // Intentionally not using parallelism here, so that this and above
         // benchmark only compare the bit-vector ops.
         // For benchmarking the parallel code, change bellow for loop to:
@@ -136,7 +135,7 @@ fn bench_add_hash_atomic(bencher: &mut Bencher) {
         for hash_value in &hash_values {
             bloom.add(hash_value);
         }
-        let index = rng.gen_range(0, hash_values.len());
+        let index = rng.gen_range(0..hash_values.len());
         if !bloom.contains(&hash_values[index]) {
             fail += 1;
         }

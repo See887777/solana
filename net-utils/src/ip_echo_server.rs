@@ -1,11 +1,12 @@
 use {
-    crate::{HEADER_LENGTH, IP_ECHO_SERVER_RESPONSE_LENGTH},
+    crate::{bind_to_unspecified, HEADER_LENGTH, IP_ECHO_SERVER_RESPONSE_LENGTH},
     log::*,
     serde_derive::{Deserialize, Serialize},
-    solana_sdk::deserialize_utils::default_on_eof,
+    solana_serde::default_on_eof,
     std::{
         io,
         net::{IpAddr, SocketAddr},
+        num::NonZeroUsize,
         time::Duration,
     },
     tokio::{
@@ -18,6 +19,13 @@ use {
 
 pub type IpEchoServer = Runtime;
 
+// Enforce a minimum of two threads:
+// - One thread to monitor the TcpListener and spawn async tasks
+// - One thread to service the spawned tasks
+pub const MINIMUM_IP_ECHO_SERVER_THREADS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+// IP echo requests require little computation and come in fairly infrequently,
+// so keep the number of server workers small to avoid overhead
+pub const DEFAULT_IP_ECHO_SERVER_THREADS: NonZeroUsize = MINIMUM_IP_ECHO_SERVER_THREADS;
 pub const MAX_PORT_COUNT_PER_MESSAGE: usize = 4;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -51,9 +59,8 @@ impl IpEchoServerMessage {
 
 pub(crate) fn ip_echo_server_request_length() -> usize {
     const REQUEST_TERMINUS_LENGTH: usize = 1;
-    HEADER_LENGTH
-        + bincode::serialized_size(&IpEchoServerMessage::default()).unwrap() as usize
-        + REQUEST_TERMINUS_LENGTH
+    (HEADER_LENGTH + REQUEST_TERMINUS_LENGTH)
+        .wrapping_add(bincode::serialized_size(&IpEchoServerMessage::default()).unwrap() as usize)
 }
 
 async fn process_connection(
@@ -102,7 +109,7 @@ async fn process_connection(
     trace!("request: {:?}", msg);
 
     // Fire a datagram at each non-zero UDP port
-    match std::net::UdpSocket::bind("0.0.0.0:0") {
+    match bind_to_unspecified() {
         Ok(udp_socket) => {
             for udp_port in &msg.udp_ports {
                 if *udp_port != 0 {
@@ -164,16 +171,22 @@ async fn run_echo_server(tcp_listener: std::net::TcpListener, shred_version: Opt
     }
 }
 
-/// Starts a simple TCP server on the given port that echos the IP address of any peer that
-/// connects.  Used by |get_public_ip_addr|
+/// Starts a simple TCP server that echos the IP address of any peer that connects
+/// Used by functions like |get_public_ip_addr| and |get_cluster_shred_version|
 pub fn ip_echo_server(
     tcp_listener: std::net::TcpListener,
+    num_server_threads: NonZeroUsize,
     // Cluster shred-version of the node running the server.
     shred_version: Option<u16>,
 ) -> IpEchoServer {
     tcp_listener.set_nonblocking(true).unwrap();
 
-    let runtime = Runtime::new().expect("Failed to create Runtime");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("solIpEchoSrvrRt")
+        .worker_threads(num_server_threads.get())
+        .enable_all()
+        .build()
+        .expect("new tokio runtime");
     runtime.spawn(run_echo_server(tcp_listener, shred_version));
     runtime
 }

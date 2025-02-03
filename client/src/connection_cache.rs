@@ -1,3 +1,4 @@
+pub use solana_connection_cache::connection_cache::Protocol;
 use {
     quinn::Endpoint,
     solana_connection_cache::{
@@ -7,12 +8,14 @@ use {
             NewConnectionConfig,
         },
     },
+    solana_keypair::Keypair,
+    solana_pubkey::Pubkey,
     solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool},
-    solana_sdk::{pubkey::Pubkey, signature::Keypair, transport::Result as TransportResult},
+    solana_quic_definitions::NotifyKeyUpdate,
     solana_streamer::streamer::StakedNodes,
+    solana_transaction_error::TransportResult,
     solana_udp_client::{UdpConfig, UdpConnectionManager, UdpPool},
     std::{
-        error::Error,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::{Arc, RwLock},
     },
@@ -42,14 +45,39 @@ pub enum NonblockingClientConnection {
     Udp(Arc<<UdpBaseClientConnection as BaseClientConnection>::NonblockingClientConnection>),
 }
 
+impl NotifyKeyUpdate for ConnectionCache {
+    fn update_key(&self, key: &Keypair) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Udp(_) => Ok(()),
+            Self::Quic(backend) => backend.update_key(key),
+        }
+    }
+}
+
 impl ConnectionCache {
-    /// Create a quic connection_cache
-    pub fn new(connection_pool_size: usize) -> Self {
-        Self::new_with_client_options(connection_pool_size, None, None, None)
+    pub fn new(name: &'static str) -> Self {
+        if DEFAULT_CONNECTION_CACHE_USE_QUIC {
+            let cert_info = (&Keypair::new(), IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+            ConnectionCache::new_with_client_options(
+                name,
+                DEFAULT_CONNECTION_POOL_SIZE,
+                None, // client_endpoint
+                Some(cert_info),
+                None, // stake_info
+            )
+        } else {
+            ConnectionCache::with_udp(name, DEFAULT_CONNECTION_POOL_SIZE)
+        }
     }
 
-    /// Create a quic conneciton_cache with more client options
+    /// Create a quic connection_cache
+    pub fn new_quic(name: &'static str, connection_pool_size: usize) -> Self {
+        Self::new_with_client_options(name, connection_pool_size, None, None, None)
+    }
+
+    /// Create a quic connection_cache with more client options
     pub fn new_with_client_options(
+        name: &'static str,
         connection_pool_size: usize,
         client_endpoint: Option<Endpoint>,
         cert_info: Option<(&Keypair, IpAddr)>,
@@ -62,46 +90,31 @@ impl ConnectionCache {
             config.update_client_endpoint(client_endpoint);
         }
         if let Some(cert_info) = cert_info {
-            config
-                .update_client_certificate(cert_info.0, cert_info.1)
-                .unwrap();
+            config.update_client_certificate(cert_info.0, cert_info.1);
         }
         if let Some(stake_info) = stake_info {
             config.set_staked_nodes(stake_info.0, stake_info.1);
         }
         let connection_manager = QuicConnectionManager::new_with_connection_config(config);
-        let cache = BackendConnectionCache::new(connection_manager, connection_pool_size).unwrap();
+        let cache =
+            BackendConnectionCache::new(name, connection_manager, connection_pool_size).unwrap();
         Self::Quic(Arc::new(cache))
     }
 
-    #[deprecated(
-        since = "1.15.0",
-        note = "This method does not do anything. Please use `new_with_client_options` instead to set the client certificate."
-    )]
-    pub fn update_client_certificate(
-        &mut self,
-        _keypair: &Keypair,
-        _ipaddr: IpAddr,
-    ) -> Result<(), Box<dyn Error>> {
-        Ok(())
+    #[inline]
+    pub fn protocol(&self) -> Protocol {
+        match self {
+            Self::Quic(_) => Protocol::QUIC,
+            Self::Udp(_) => Protocol::UDP,
+        }
     }
 
-    #[deprecated(
-        since = "1.15.0",
-        note = "This method does not do anything. Please use `new_with_client_options` instead to set staked nodes information."
-    )]
-    pub fn set_staked_nodes(
-        &mut self,
-        _staked_nodes: &Arc<RwLock<StakedNodes>>,
-        _client_pubkey: &Pubkey,
-    ) {
-    }
-
-    pub fn with_udp(connection_pool_size: usize) -> Self {
+    pub fn with_udp(name: &'static str, connection_pool_size: usize) -> Self {
         // The minimum pool size is 1.
         let connection_pool_size = 1.max(connection_pool_size);
         let connection_manager = UdpConnectionManager::default();
-        let cache = BackendConnectionCache::new(connection_manager, connection_pool_size).unwrap();
+        let cache =
+            BackendConnectionCache::new(name, connection_manager, connection_pool_size).unwrap();
         Self::Udp(Arc::new(cache))
     }
 
@@ -128,37 +141,21 @@ impl ConnectionCache {
     }
 }
 
-impl Default for ConnectionCache {
-    fn default() -> Self {
-        if DEFAULT_CONNECTION_CACHE_USE_QUIC {
-            let cert_info = (&Keypair::new(), IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
-            ConnectionCache::new_with_client_options(
-                DEFAULT_CONNECTION_POOL_SIZE,
-                None,
-                Some(cert_info),
-                None,
-            )
-        } else {
-            ConnectionCache::with_udp(DEFAULT_CONNECTION_POOL_SIZE)
-        }
-    }
-}
-
 macro_rules! dispatch {
-    ($(#[$meta:meta])* $vis:vis fn $name:ident$(<$($t:ident: $cons:ident),*>)?(&self $(, $arg:ident: $ty:ty)*) $(-> $out:ty)?) => {
+    ($(#[$meta:meta])* $vis:vis fn $name:ident$(<$($t:ident: $cons:ident + ?Sized),*>)?(&self $(, $arg:ident: $ty:ty)*) $(-> $out:ty)?) => {
         #[inline]
         $(#[$meta])*
-        $vis fn $name$(<$($t: $cons),*>)?(&self $(, $arg:$ty)*) $(-> $out)? {
+        $vis fn $name$(<$($t: $cons + ?Sized),*>)?(&self $(, $arg:$ty)*) $(-> $out)? {
             match self {
                 Self::Quic(this) => this.$name($($arg, )*),
                 Self::Udp(this) => this.$name($($arg, )*),
             }
         }
     };
-    ($(#[$meta:meta])* $vis:vis fn $name:ident$(<$($t:ident: $cons:ident),*>)?(&mut self $(, $arg:ident: $ty:ty)*) $(-> $out:ty)?) => {
+    ($(#[$meta:meta])* $vis:vis fn $name:ident$(<$($t:ident: $cons:ident + ?Sized),*>)?(&mut self $(, $arg:ident: $ty:ty)*) $(-> $out:ty)?) => {
         #[inline]
         $(#[$meta])*
-        $vis fn $name$(<$($t: $cons),*>)?(&mut self $(, $arg:$ty)*) $(-> $out)? {
+        $vis fn $name$(<$($t: $cons + ?Sized),*>)?(&mut self $(, $arg:$ty)*) $(-> $out)? {
             match self {
                 Self::Quic(this) => this.$name($($arg, )*),
                 Self::Udp(this) => this.$name($($arg, )*),
@@ -204,9 +201,10 @@ mod tests {
         super::*,
         crate::connection_cache::ConnectionCache,
         crossbeam_channel::unbounded,
-        solana_sdk::{quic::QUIC_PORT_OFFSET, signature::Keypair},
+        solana_keypair::Keypair,
+        solana_net_utils::bind_to_localhost,
         solana_streamer::{
-            nonblocking::quic::DEFAULT_WAIT_FOR_CHUNK_TIMEOUT_MS, quic::StreamStats,
+            quic::{QuicServerParams, SpawnServerResult},
             streamer::StakedNodes,
         },
         std::{
@@ -218,68 +216,65 @@ mod tests {
         },
     };
 
-    fn server_args() -> (
-        UdpSocket,
-        Arc<AtomicBool>,
-        Keypair,
-        IpAddr,
-        Arc<StreamStats>,
-    ) {
+    fn server_args() -> (UdpSocket, Arc<AtomicBool>, Keypair) {
         (
-            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            bind_to_localhost().unwrap(),
             Arc::new(AtomicBool::new(false)),
             Keypair::new(),
-            "127.0.0.1".parse().unwrap(),
-            Arc::new(StreamStats::default()),
         )
     }
 
     #[test]
     fn test_connection_with_specified_client_endpoint() {
-        let port = u16::MAX - QUIC_PORT_OFFSET + 1;
-        assert!(port.checked_add(QUIC_PORT_OFFSET).is_none());
-
         // Start a response receiver:
-        let (
-            response_recv_socket,
-            response_recv_exit,
-            keypair2,
-            response_recv_ip,
-            response_recv_stats,
-        ) = server_args();
+        let (response_recv_socket, response_recv_exit, keypair2) = server_args();
         let (sender2, _receiver2) = unbounded();
 
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
 
-        let (response_recv_endpoint, response_recv_thread) = solana_streamer::quic::spawn_server(
+        let SpawnServerResult {
+            endpoints: mut response_recv_endpoints,
+            thread: response_recv_thread,
+            key_updater: _,
+        } = solana_streamer::quic::spawn_server(
+            "solQuicTest",
+            "quic_streamer_test",
             response_recv_socket,
             &keypair2,
-            response_recv_ip,
             sender2,
             response_recv_exit.clone(),
-            1,
             staked_nodes,
-            10,
-            10,
-            response_recv_stats,
-            DEFAULT_WAIT_FOR_CHUNK_TIMEOUT_MS,
+            QuicServerParams {
+                max_connections_per_peer: 1,
+                max_staked_connections: 10,
+                max_unstaked_connections: 10,
+                ..QuicServerParams::default()
+            },
         )
         .unwrap();
 
-        let connection_cache =
-            ConnectionCache::new_with_client_options(1, Some(response_recv_endpoint), None, None);
+        let response_recv_endpoint = response_recv_endpoints
+            .pop()
+            .expect("at least one endpoint");
+        let connection_cache = ConnectionCache::new_with_client_options(
+            "connection_cache_test",
+            1,                            // connection_pool_size
+            Some(response_recv_endpoint), // client_endpoint
+            None,                         // cert_info
+            None,                         // stake_info
+        );
 
         // server port 1:
         let port1 = 9001;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port1);
         let conn = connection_cache.get_connection(&addr);
-        assert_eq!(conn.server_addr().port(), port1 + QUIC_PORT_OFFSET);
+        assert_eq!(conn.server_addr().port(), port1);
 
         // server port 2:
         let port2 = 9002;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port2);
         let conn = connection_cache.get_connection(&addr);
-        assert_eq!(conn.server_addr().port(), port2 + QUIC_PORT_OFFSET);
+        assert_eq!(conn.server_addr().port(), port2);
 
         response_recv_exit.store(true, Ordering::Relaxed);
         response_recv_thread.join().unwrap();

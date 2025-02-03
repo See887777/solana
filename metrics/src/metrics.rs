@@ -6,7 +6,8 @@ use {
     gethostname::gethostname,
     lazy_static::lazy_static,
     log::*,
-    solana_sdk::hash::hash,
+    solana_cluster_type::ClusterType,
+    solana_sha256_hasher::hash,
     std::{
         cmp,
         collections::HashMap,
@@ -17,9 +18,30 @@ use {
         thread,
         time::{Duration, Instant, UNIX_EPOCH},
     },
+    thiserror::Error,
 };
 
 type CounterMap = HashMap<(&'static str, u64), CounterPoint>;
+
+#[derive(Debug, Error)]
+pub enum MetricsError {
+    #[error(transparent)]
+    VarError(#[from] env::VarError),
+    #[error(transparent)]
+    ReqwestError(#[from] reqwest::Error),
+    #[error("SOLANA_METRICS_CONFIG is invalid: '{0}'")]
+    ConfigInvalid(String),
+    #[error("SOLANA_METRICS_CONFIG is incomplete")]
+    ConfigIncomplete,
+    #[error("SOLANA_METRICS_CONFIG database mismatch: {0}")]
+    DbMismatch(String),
+}
+
+impl From<MetricsError> for String {
+    fn from(error: MetricsError) -> Self {
+        error.to_string()
+    }
+}
 
 impl From<&CounterPoint> for DataPoint {
     fn from(counter_point: &CounterPoint) -> Self {
@@ -58,7 +80,7 @@ impl InfluxDbMetricsWriter {
         }
     }
 
-    fn build_write_url() -> Result<String, String> {
+    fn build_write_url() -> Result<String, MetricsError> {
         let config = get_metrics_config().map_err(|err| {
             info!("metrics disabled: {}", err);
             err
@@ -182,51 +204,84 @@ impl MetricsAgent {
         Self { sender }
     }
 
-    fn collect_points(points: &mut Vec<DataPoint>, counters: &mut CounterMap) -> Vec<DataPoint> {
-        let mut ret = std::mem::take(points);
-        ret.extend(counters.values().map(|v| v.into()));
-        counters.clear();
-        ret
-    }
-
-    fn write(
-        writer: &Arc<dyn MetricsWriter + Send + Sync>,
-        mut points: Vec<DataPoint>,
+    // Combines `points` and `counters` into a single array of `DataPoint`s, appending a data point
+    // with the metrics stats at the end.
+    //
+    // Limits the number of produced points to the `max_points` value.  Takes `points` followed by
+    // `counters`, dropping `counters` first.
+    //
+    // `max_points_per_sec` is only used in a warning message.
+    // `points_buffered` is used in the stats.
+    fn combine_points(
         max_points: usize,
         max_points_per_sec: usize,
-        last_write_time: Instant,
+        secs_since_last_write: u64,
         points_buffered: usize,
-    ) {
-        if points.is_empty() {
-            return;
-        }
+        points: &mut Vec<DataPoint>,
+        counters: &mut CounterMap,
+    ) -> Vec<DataPoint> {
+        // Reserve one slot for the stats point we will add at the end.
+        let max_points = max_points.saturating_sub(1);
 
-        let now = Instant::now();
-        let num_points = points.len();
+        let num_points = points.len().saturating_add(counters.len());
+        let fit_counters = max_points.saturating_sub(points.len());
+        let points_written = cmp::min(num_points, max_points);
+
         debug!("run: attempting to write {} points", num_points);
+
         if num_points > max_points {
             warn!(
-                "max submission rate of {} datapoints per second exceeded.  only the
-                    first {} of {} points will be submitted",
+                "Max submission rate of {} datapoints per second exceeded.  Only the \
+                 first {} of {} points will be submitted.",
                 max_points_per_sec, max_points, num_points
             );
         }
-        let points_written = cmp::min(num_points, max_points - 1);
-        points.truncate(points_written);
-        points.push(
+
+        let mut combined = std::mem::take(points);
+        combined.truncate(points_written);
+
+        combined.extend(counters.values().take(fit_counters).map(|v| v.into()));
+        counters.clear();
+
+        combined.push(
             DataPoint::new("metrics")
                 .add_field_i64("points_written", points_written as i64)
                 .add_field_i64("num_points", num_points as i64)
                 .add_field_i64("points_lost", (num_points - points_written) as i64)
                 .add_field_i64("points_buffered", points_buffered as i64)
-                .add_field_i64(
-                    "secs_since_last_write",
-                    now.duration_since(last_write_time).as_secs() as i64,
-                )
+                .add_field_i64("secs_since_last_write", secs_since_last_write as i64)
                 .to_owned(),
         );
 
-        writer.write(points);
+        combined
+    }
+
+    // Consumes provided `points`, sending up to `max_points` of them into the `writer`.
+    //
+    // Returns an updated value for `last_write_time`.  Which is equal to `Instant::now()`, just
+    // before `write` in updated.
+    fn write(
+        writer: &Arc<dyn MetricsWriter + Send + Sync>,
+        max_points: usize,
+        max_points_per_sec: usize,
+        last_write_time: Instant,
+        points_buffered: usize,
+        points: &mut Vec<DataPoint>,
+        counters: &mut CounterMap,
+    ) -> Instant {
+        let now = Instant::now();
+        let secs_since_last_write = now.duration_since(last_write_time).as_secs();
+
+        writer.write(Self::combine_points(
+            max_points,
+            max_points_per_sec,
+            secs_since_last_write,
+            points_buffered,
+            points,
+            counters,
+        ));
+
+        now
     }
 
     fn run(
@@ -242,20 +297,28 @@ impl MetricsAgent {
 
         let max_points = write_frequency.as_secs() as usize * max_points_per_sec;
 
+        // Bind common arguments in the `Self::write()` call.
+        let write = |last_write_time: Instant,
+                     points: &mut Vec<DataPoint>,
+                     counters: &mut CounterMap|
+         -> Instant {
+            Self::write(
+                writer,
+                max_points,
+                max_points_per_sec,
+                last_write_time,
+                receiver.len(),
+                points,
+                counters,
+            )
+        };
+
         loop {
             match receiver.recv_timeout(write_frequency / 2) {
                 Ok(cmd) => match cmd {
                     MetricsCommand::Flush(barrier) => {
                         debug!("metrics_thread: flush");
-                        Self::write(
-                            writer,
-                            Self::collect_points(&mut points, &mut counters),
-                            max_points,
-                            max_points_per_sec,
-                            last_write_time,
-                            receiver.len(),
-                        );
-                        last_write_time = Instant::now();
+                        last_write_time = write(last_write_time, &mut points, &mut counters);
                         barrier.wait();
                     }
                     MetricsCommand::Submit(point, level) => {
@@ -272,9 +335,7 @@ impl MetricsAgent {
                         }
                     }
                 },
-                Err(RecvTimeoutError::Timeout) => {
-                    trace!("run: receive timeout");
-                }
+                Err(RecvTimeoutError::Timeout) => (),
                 Err(RecvTimeoutError::Disconnected) => {
                     debug!("run: sender disconnected");
                     break;
@@ -283,17 +344,19 @@ impl MetricsAgent {
 
             let now = Instant::now();
             if now.duration_since(last_write_time) >= write_frequency {
-                Self::write(
-                    writer,
-                    Self::collect_points(&mut points, &mut counters),
-                    max_points,
-                    max_points_per_sec,
-                    last_write_time,
-                    receiver.len(),
-                );
-                last_write_time = now;
+                last_write_time = write(last_write_time, &mut points, &mut counters);
             }
         }
+
+        debug_assert!(
+            points.is_empty() && counters.is_empty(),
+            "Controlling `MetricsAgent` is expected to call `flush()` from the `Drop` \n\
+             implementation, before exiting.  So both `points` and `counters` must be empty at \n\
+             this point.\n\
+             `points`: {points:?}\n\
+             `counters`: {counters:?}",
+        );
+
         trace!("run: exit");
     }
 
@@ -326,16 +389,12 @@ impl Drop for MetricsAgent {
     }
 }
 
-fn get_singleton_agent() -> Arc<Mutex<MetricsAgent>> {
-    static INIT: Once = Once::new();
-    static mut AGENT: Option<Arc<Mutex<MetricsAgent>>> = None;
-    unsafe {
-        INIT.call_once(|| AGENT = Some(Arc::new(Mutex::new(MetricsAgent::default()))));
-        match AGENT {
-            Some(ref agent) => agent.clone(),
-            None => panic!("Failed to initialize metrics agent"),
-        }
-    }
+fn get_singleton_agent() -> &'static MetricsAgent {
+    lazy_static! {
+        static ref AGENT: MetricsAgent = MetricsAgent::default();
+    };
+
+    &AGENT
 }
 
 lazy_static! {
@@ -357,16 +416,14 @@ pub fn set_host_id(host_id: String) {
 /// Submits a new point from any thread.  Note that points are internally queued
 /// and transmitted periodically in batches.
 pub fn submit(point: DataPoint, level: log::Level) {
-    let agent_mutex = get_singleton_agent();
-    let agent = agent_mutex.lock().unwrap();
+    let agent = get_singleton_agent();
     agent.submit(point, level);
 }
 
 /// Submits a new counter or updates an existing counter from any thread.  Note that points are
 /// internally queued and transmitted periodically in batches.
 pub(crate) fn submit_counter(point: CounterPoint, level: log::Level, bucket: u64) {
-    let agent_mutex = get_singleton_agent();
-    let agent = agent_mutex.lock().unwrap();
+    let agent = get_singleton_agent();
     agent.submit_counter(point, level, bucket);
 }
 
@@ -387,16 +444,17 @@ impl MetricsConfig {
     }
 }
 
-fn get_metrics_config() -> Result<MetricsConfig, String> {
+fn get_metrics_config() -> Result<MetricsConfig, MetricsError> {
     let mut config = MetricsConfig::default();
-
-    let config_var =
-        env::var("SOLANA_METRICS_CONFIG").map_err(|err| format!("SOLANA_METRICS_CONFIG: {err}"))?;
+    let config_var = env::var("SOLANA_METRICS_CONFIG")?;
+    if config_var.is_empty() {
+        Err(env::VarError::NotPresent)?;
+    }
 
     for pair in config_var.split(',') {
         let nv: Vec<_> = pair.split('=').collect();
         if nv.len() != 2 {
-            return Err(format!("SOLANA_METRICS_CONFIG is invalid: '{pair}'"));
+            return Err(MetricsError::ConfigInvalid(pair.to_string()));
         }
         let v = nv[1].to_string();
         match nv[0] {
@@ -404,27 +462,42 @@ fn get_metrics_config() -> Result<MetricsConfig, String> {
             "db" => config.db = v,
             "u" => config.username = v,
             "p" => config.password = v,
-            _ => return Err(format!("SOLANA_METRICS_CONFIG is invalid: '{pair}'")),
+            _ => return Err(MetricsError::ConfigInvalid(pair.to_string())),
         }
     }
 
     if !config.complete() {
-        return Err("SOLANA_METRICS_CONFIG is incomplete".to_string());
+        return Err(MetricsError::ConfigIncomplete);
     }
+
     Ok(config)
 }
 
-pub fn query(q: &str) -> Result<String, String> {
+pub fn metrics_config_sanity_check(cluster_type: ClusterType) -> Result<(), MetricsError> {
+    let config = match get_metrics_config() {
+        Ok(config) => config,
+        Err(MetricsError::VarError(env::VarError::NotPresent)) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    match &config.db[..] {
+        "mainnet-beta" if cluster_type != ClusterType::MainnetBeta => (),
+        "tds" if cluster_type != ClusterType::Testnet => (),
+        "devnet" if cluster_type != ClusterType::Devnet => (),
+        _ => return Ok(()),
+    };
+    let (host, db) = (&config.host, &config.db);
+    let msg = format!("cluster_type={cluster_type:?} host={host} database={db}");
+    Err(MetricsError::DbMismatch(msg))
+}
+
+pub fn query(q: &str) -> Result<String, MetricsError> {
     let config = get_metrics_config()?;
     let query_url = format!(
         "{}/query?u={}&p={}&q={}",
         &config.host, &config.username, &config.password, &q
     );
 
-    let response = reqwest::blocking::get(query_url.as_str())
-        .map_err(|err| err.to_string())?
-        .text()
-        .map_err(|err| err.to_string())?;
+    let response = reqwest::blocking::get(query_url.as_str())?.text()?;
 
     Ok(response)
 }
@@ -432,8 +505,7 @@ pub fn query(q: &str) -> Result<String, String> {
 /// Blocks until all pending points from previous calls to `submit` have been
 /// transmitted.
 pub fn flush() {
-    let agent_mutex = get_singleton_agent();
-    let agent = agent_mutex.lock().unwrap();
+    let agent = get_singleton_agent();
     agent.flush();
 }
 
@@ -477,7 +549,6 @@ pub mod test_mocks {
         pub points_written: Arc<Mutex<Vec<DataPoint>>>,
     }
     impl MockMetricsWriter {
-        #[allow(dead_code)]
         pub fn new() -> Self {
             MockMetricsWriter {
                 points_written: Arc::new(Mutex::new(Vec::new())),
@@ -500,10 +571,7 @@ pub mod test_mocks {
             assert!(!points.is_empty());
 
             let new_points = points.len();
-            self.points_written
-                .lock()
-                .unwrap()
-                .extend(points.into_iter());
+            self.points_written.lock().unwrap().extend(points);
 
             info!(
                 "Writing {} points ({} total)",
@@ -601,12 +669,15 @@ mod test {
     #[test]
     fn test_submit_exceed_max_rate() {
         let writer = Arc::new(MockMetricsWriter::new());
-        let agent = MetricsAgent::new(writer.clone(), Duration::from_secs(1), 100);
 
-        for i in 0..102 {
+        let max_points_per_sec = 100;
+
+        let agent = MetricsAgent::new(writer.clone(), Duration::from_secs(1), max_points_per_sec);
+
+        for i in 0..(max_points_per_sec + 20) {
             agent.submit(
                 DataPoint::new("measurement")
-                    .add_field_i64("i", i)
+                    .add_field_i64("i", i.try_into().unwrap())
                     .to_owned(),
                 Level::Info,
             );
@@ -615,7 +686,11 @@ mod test {
         thread::sleep(Duration::from_secs(2));
 
         agent.flush();
-        assert_eq!(writer.points_written(), 100);
+
+        // We are expecting `max_points_per_sec - 1` data points from `submit()` and two more metric
+        // stats data points.  One from the timeout when all the `submit()`ed values are sent when 1
+        // second is elapsed, and then one more from the explicit `flush()`.
+        assert_eq!(writer.points_written(), max_points_per_sec + 1);
     }
 
     #[test]
@@ -656,6 +731,9 @@ mod test {
             agent.submit(DataPoint::new("point 1"), Level::Info);
         }
 
+        // The datapoints we expect to see are:
+        // 1. `point 1` from the above.
+        // 2. `metrics` stats submitted as a result of the `Flush` sent by `agent` being destroyed.
         assert_eq!(writer.points_written(), 2);
     }
 

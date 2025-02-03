@@ -61,15 +61,6 @@ impl OptimisticConfirmationVerifier {
             return;
         }
 
-        datapoint_info!(
-            "optimistic_slot_elapsed",
-            (
-                "average_elapsed_ms",
-                self.last_optimistic_slot_ts.elapsed().as_millis() as i64,
-                i64
-            ),
-        );
-
         // We don't have any information about ancestors before the snapshot root,
         // so ignore those slots
         for (new_optimistic_slot, hash) in new_optimistic_slots {
@@ -157,8 +148,8 @@ impl OptimisticConfirmationVerifier {
 mod test {
     use {
         super::*, crate::vote_simulator::VoteSimulator,
-        solana_ledger::get_tmp_ledger_path_auto_delete, solana_runtime::bank::Bank,
-        solana_sdk::pubkey::Pubkey, std::collections::HashMap, trees::tr,
+        solana_ledger::get_tmp_ledger_path_auto_delete, solana_pubkey::Pubkey,
+        solana_runtime::bank::Bank, std::collections::HashMap, trees::tr,
     };
 
     #[test]
@@ -195,7 +186,7 @@ mod test {
         let snapshot_start_slot = 0;
         let mut optimistic_confirmation_verifier =
             OptimisticConfirmationVerifier::new(snapshot_start_slot);
-        let bad_bank_hash = Hash::new(&[42u8; 32]);
+        let bad_bank_hash = Hash::new_from_array([42u8; 32]);
         let blockstore_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(blockstore_path.path()).unwrap();
         let optimistic_slots = vec![(1, bad_bank_hash), (3, Hash::default())];
@@ -288,7 +279,7 @@ mod test {
             .bank_forks
             .write()
             .unwrap()
-            .insert(Bank::new_from_parent(&bank6, &Pubkey::default(), 7));
+            .insert(Bank::new_from_parent(bank6, &Pubkey::default(), 7));
         let bank7 = vote_simulator.bank_forks.read().unwrap().get(7).unwrap();
         assert!(!bank7.ancestors.contains_key(&3));
 
@@ -304,7 +295,7 @@ mod test {
         assert!(optimistic_confirmation_verifier.unchecked_slots.is_empty());
 
         // If we know set the root in blockstore, should return nothing
-        blockstore.set_roots(vec![1, 3].iter()).unwrap();
+        blockstore.set_roots([1, 3].iter()).unwrap();
         optimistic_confirmation_verifier
             .add_new_optimistic_confirmed_slots(optimistic_slots, &blockstore);
         assert!(optimistic_confirmation_verifier
